@@ -1,9 +1,13 @@
-function run_gyroid_generation(analysis_file)
+function run_gyroid_generation(analysis_file, cfg)
 % Fresh, minimal gyroid generator with parallel φ evaluation.
 % Uses: infill.gyroid_phi_at_point, infill.gyroid_phi_trilinear, infill.eval_gyroid_layer
 
 fprintf('--- Gyroid generation: loading analysis ---\n');
 D = load(analysis_file);
+
+if nargin < 2 || isempty(cfg)
+    cfg = struct();
+end
 
 % ---------------- User parameters ----------------
 w          = 0.40;      % mm, extrusion width
@@ -18,9 +22,9 @@ preview_step = 0.25;     % mm voxel for 3D preview
 xy_step      = 0.25;    % mm sampling for layer contours
 layer_height = 0.20;    % mm layer height for example slicing
 
-do_preview_3d   = true;
-do_single_slice = false; % build one mid-slice contour as a sanity check
-do_zoned_preview = true;   % show 3D preview for K-means (zoned) gyroid
+do_preview_3d    = get_cfg_flag(cfg, 'gyroidPreview3d', true);
+do_single_slice  = get_cfg_flag(cfg, 'gyroidSingleSlice', false); % build one mid-slice contour as a sanity check
+do_zoned_preview = get_cfg_flag(cfg, 'gyroidZonedPreview3d', true);   % show 3D preview for K-means (zoned) gyroid
 % -------------------------------------------------
 % Optional: spatial phase shift to move the gyroid pattern in space (mm)
 phase_mm = [1.5, 0.0, 0.0];  % tweak ±1–3 mm if a channel lines up with a thin region
@@ -315,7 +319,7 @@ end
 
 % -------- Optional: Zoned previews (safe clamp) ---
 % (Enable if you want to inspect zoned behavior now)
-do_zoned = false;
+do_zoned = get_cfg_flag(cfg, 'gyroidZonedSlice', false);
 if do_zoned
     fprintf('Evaluating one layer (zoned)...\n');
     z_mid = origin(3) + spacing(3)*(floor(sz(3)/2));
@@ -330,3 +334,17 @@ end
 fprintf('Gyroid generation done.\n');
 end
 
+function value = get_cfg_flag(cfg, fieldName, defaultValue)
+    value = defaultValue;
+    if ~isstruct(cfg) || ~isfield(cfg, 'features')
+        return;
+    end
+    if isfield(cfg.features, fieldName)
+        candidate = cfg.features.(fieldName);
+        if islogical(candidate) && isscalar(candidate)
+            value = candidate;
+        else
+            error('cfg.features.%s must be a logical scalar.', fieldName);
+        end
+    end
+end

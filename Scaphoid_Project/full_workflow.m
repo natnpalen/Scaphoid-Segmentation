@@ -12,19 +12,37 @@ close all
 rehash toolboxcache
 
 %% ===================== USER CONFIG =====================
+% Canonical feature flags live under cfg.features.
+% Toggle any stage or preview in one place:
+%   cfg.features.runGyroid            -> Step 2 (gyroid generation)
+%   cfg.features.runPartition         -> Step 3 (mesh partition)
+%   cfg.features.showPopups           -> density analysis visualizations
+%   cfg.features.gyroidPreview3d      -> 3D gyroid preview (continuous)
+%   cfg.features.gyroidSingleSlice    -> single-slice gyroid preview
+%   cfg.features.gyroidZonedPreview3d -> 3D zoned gyroid preview
+%   cfg.features.gyroidZonedSlice     -> single-slice zoned preview
+cfg = struct();
+
 % Choose mode: "single" or "batch"
-MODE = "single";     % <- change to "batch" to process many
+cfg.mode = "single";     % <- change to "batch" to process many
 
-% Single-case input (used if MODE == "single")
-single.dicomFolder = "C:\Users\natha\Downloads\Dicom Series 1-32\Scaphoid 1";
+% Single-case input (used if cfg.mode == "single")
+cfg.single.dicomFolder = "C:\Users\natha\Downloads\Dicom Series 1-32\Scaphoid 1";
 
-% Batch input (used if MODE == "batch")
-batch.topLevelFolder = "C:\Users\natha\Downloads\Dicom Series Scaphoid";
+% Batch input (used if cfg.mode == "batch")
+cfg.batch.topLevelFolder = "C:\Users\natha\Downloads\Dicom Series Scaphoid";
 
 % Common options
-upsamplingFactor = 4;        % for run_mesh_partition
-enableGyroid     = false;     % set false to skip Step 2 in either mode
-enablePartition  = true;     % set false to skip Step 3 in either mode
+cfg.mesh.upsamplingFactor = 4;        % for run_mesh_partition
+
+% Feature toggles (single source of truth)
+cfg.features.runGyroid            = false;
+cfg.features.runPartition         = true;
+cfg.features.showPopups           = false;
+cfg.features.gyroidPreview3d      = true;
+cfg.features.gyroidSingleSlice    = false;
+cfg.features.gyroidZonedPreview3d = true;
+cfg.features.gyroidZonedSlice     = false;
 % ========================================================
 
 
@@ -40,22 +58,22 @@ setenv('TEMP',   short_tmp_root);
 setenv('TMP',    short_tmp_root);
 
 t_all = tic;
-switch lower(string(MODE))
+switch lower(string(cfg.mode))
     case "single"
         fprintf('=====================================================\n');
         fprintf('                MODE: SINGLE CASE\n');
         fprintf('=====================================================\n');
-        process_one_case(single.dicomFolder, upsamplingFactor, enableGyroid, enablePartition);
+        process_one_case(cfg.single.dicomFolder, cfg);
 
     case "batch"
         fprintf('=====================================================\n');
         fprintf('                MODE: BATCH PROCESS\n');
-        fprintf('  Root: %s\n', batch.topLevelFolder);
+        fprintf('  Root: %s\n', cfg.batch.topLevelFolder);
         fprintf('=====================================================\n');
 
-        caseFolders = list_candidate_cases(batch.topLevelFolder);
+        caseFolders = list_candidate_cases(cfg.batch.topLevelFolder);
         if isempty(caseFolders)
-            warning('No candidate case folders found under: %s', batch.topLevelFolder);
+            warning('No candidate case folders found under: %s', cfg.batch.topLevelFolder);
         end
 
         n = numel(caseFolders);
@@ -66,7 +84,7 @@ switch lower(string(MODE))
             banner(sprintf('STARTING CASE %d/%d: %s', idx, n, caseDir));
 
             try
-                process_one_case(caseDir, upsamplingFactor, enableGyroid, enablePartition);
+                process_one_case(caseDir, cfg);
                 banner(sprintf('COMPLETED CASE %d/%d', idx, n));
             catch ME
                 banner(sprintf('FAILED CASE %d/%d', idx, n));
@@ -82,7 +100,7 @@ switch lower(string(MODE))
         end
 
     otherwise
-        error('Unknown MODE: %s. Use "single" or "batch".', MODE);
+        error('Unknown MODE: %s. Use "single" or "batch".', cfg.mode);
 end
 
 fprintf('\n=====================================================\n');
@@ -92,7 +110,7 @@ fprintf('=====================================================\n');
 
 %% ======================= LOCAL FUNCTIONS =======================
 
-function process_one_case(dicomFolder, upsamplingFactor, enableGyroid, enablePartition)
+function process_one_case(dicomFolder, cfg)
     % Validate input
     if ~isfolder(dicomFolder)
         error('DICOM folder not found: %s', dicomFolder);
@@ -103,24 +121,24 @@ function process_one_case(dicomFolder, upsamplingFactor, enableGyroid, enablePar
     fprintf('      STARTING: DENSITY ANALYSIS\n');
     fprintf('  Input: %s\n', dicomFolder);
     fprintf('=====================================================\n');
-    analysis_results_file = run_density_analysis(dicomFolder);
+    analysis_results_file = run_density_analysis(dicomFolder, cfg);
 
     % --- Step 2: Run Gyroid Generation (optional) ---
-    if enableGyroid
+    if cfg.features.runGyroid
         fprintf('\n=====================================================\n');
         fprintf('      STARTING: GYROID TOOLPATH GENERATION\n');
         fprintf('=====================================================\n');
-        run_gyroid_generation(analysis_results_file);
+        run_gyroid_generation(analysis_results_file, cfg);
     else
         fprintf('\n[SKIP] Gyroid generation disabled by user.\n');
     end
 
     % --- Step 3: Partition into density-region meshes (optional) ---
-    if enablePartition
+    if cfg.features.runPartition
         fprintf('\n=====================================================\n');
         fprintf('      STARTING: DENSITY REGION MESH PARTITION\n');
         fprintf('=====================================================\n');
-        run_mesh_partition(analysis_results_file, 'UpsamplingFactor', upsamplingFactor);
+        run_mesh_partition(analysis_results_file, cfg);
     else
         fprintf('\n[SKIP] Mesh partition disabled by user.\n');
     end

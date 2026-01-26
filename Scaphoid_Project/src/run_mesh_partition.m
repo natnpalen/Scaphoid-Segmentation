@@ -1,12 +1,11 @@
-function run_mesh_partition(analysis_results_file, varargin)
+function run_mesh_partition(analysis_results_file, cfg)
 %RUN_MESH_PARTITION.m Generate separate, closed meshes for k density regions (hi-res).
 
 % ---------- Step 0: parse inputs ----------
-p = inputParser;
-addRequired(p, 'analysis_results_file', @(x) isstring(x) || ischar(x));
-addParameter(p, 'UpsamplingFactor', 4, @(x) isnumeric(x) && isscalar(x) && x > 0);
-parse(p, analysis_results_file, varargin{:});
-upsamplingFactor = p.Results.UpsamplingFactor;
+if nargin < 2 || isempty(cfg)
+    cfg = struct();
+end
+upsamplingFactor = get_cfg_number(cfg, 'mesh', 'upsamplingFactor', 4);
 
 fprintf('=====================================================\n');
 fprintf(' STARTING: DENSITY REGION MESH PARTITION\n');
@@ -291,4 +290,20 @@ end
 fprintf('=====================================================\n');
 fprintf(' MESH PARTITIONING COMPLETED SUCCESSFULLY\n');
 fprintf('=====================================================\n');
+end
+
+function value = get_cfg_number(cfg, sectionName, fieldName, defaultValue)
+    value = defaultValue;
+    if ~isstruct(cfg) || ~isfield(cfg, sectionName)
+        return;
+    end
+    section = cfg.(sectionName);
+    if isfield(section, fieldName)
+        candidate = section.(fieldName);
+        if isnumeric(candidate) && isscalar(candidate) && candidate > 0
+            value = candidate;
+        else
+            error('cfg.%s.%s must be a positive scalar.', sectionName, fieldName);
+        end
+    end
 end

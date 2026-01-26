@@ -1,9 +1,9 @@
-function output_filename = run_density_analysis(dicomFolder, varargin)
+function output_filename = run_density_analysis(dicomFolder, cfg)
 % RUN_DENSITY_ANALYSIS (refactored)
-p = inputParser;
-addParameter(p, 'ShowPopups', false, @(x)islogical(x)&&isscalar(x));
-parse(p, varargin{:});
-viz = p.Results.ShowPopups;
+if nargin < 2 || isempty(cfg)
+    cfg = struct();
+end
+viz = get_cfg_flag(cfg, 'showPopups', false);
 
 % --- Step 1: pipeline ---
 fprintf('--- Step 1: Running Scaphoid Segmentation for:\n%s\n', dicomFolder);
@@ -65,4 +65,19 @@ save(output_filename, ...
     'centroids_sorted');   % <-- NEW
 
 fprintf('Results saved to:\n%s\n', output_filename);
+end
+
+function value = get_cfg_flag(cfg, fieldName, defaultValue)
+    value = defaultValue;
+    if ~isstruct(cfg) || ~isfield(cfg, 'features')
+        return;
+    end
+    if isfield(cfg.features, fieldName)
+        candidate = cfg.features.(fieldName);
+        if islogical(candidate) && isscalar(candidate)
+            value = candidate;
+        else
+            error('cfg.features.%s must be a logical scalar.', fieldName);
+        end
+    end
 end
