@@ -57,11 +57,14 @@ if opts.UseSubvoxelOuter
       % 4) Taubin smoothing (shrinkage-free)
       mesh_outer = taubinSmooth(mesh_outer, opts.TaubinIters, opts.TaubinLambdaMu(1), opts.TaubinLambdaMu(2));
       % 5) Snap vertices to strongest HU gradient along normals (±band)
+      [Hu_r, Hu_c, Hu_s] = gradient(ds.HU, ds.spacing(1), ds.spacing(2), ds.spacing(3));
+      Gmag = imgradient3(ds.HU);
+      huPrecomp = struct('Hu_r', Hu_r, 'Hu_c', Hu_c, 'Hu_s', Hu_s, 'Gmag', Gmag);
       mesh_outer = snapVerticesToGradient(mesh_outer, ds.HU, ds.spacing, ...
                                           sdf_mm, opts.SnapBandMM, opts.SnapStepMM, ...
                                           opts.SnapOutwardTolMM, opts.SnapUseLikelihood, ...
                                           opts.SnapInwardCapMM, opts.SnapSDFTauMM, ...
-                                          opts.SnapUseParfor);
+                                          opts.SnapUseParfor, huPrecomp);
       % Recompute per-vertex HU after snapping
       mesh_outer.HU = sampleVolumeAtVertices(ds.HU, ds.spacing, mesh_outer.vertices);
   catch ME
@@ -161,7 +164,7 @@ mesh.vertices = V;
   end
 end
 
-function mesh = snapVerticesToGradient(mesh, HU, spacing, sdf_mm, bandMM, stepMM, outwardTolMM, useLikelihood, inwardCapMM, sdfTauMM, useParfor)
+function mesh = snapVerticesToGradient(mesh, HU, spacing, sdf_mm, bandMM, stepMM, outwardTolMM, useLikelihood, inwardCapMM, sdfTauMM, useParfor, precomp)
 % Parallel, interpolant-based snapping with A1–A4 guardrails.
 % No nested functions; uses file-level subfunctions for parfor-compatibility.
 % ---- Setup & normals -----------------------------------------------------
@@ -187,13 +190,33 @@ rv = (0:R-1)*spacing(1);   % row coords in mm
 cv = (0:C-1)*spacing(2);   % col coords in mm
 sv = (0:S-1)*spacing(3);   % slice coords in mm
 % ---- Build gridded interpolants (B2) ------------------------------------
-F_HU   = griddedInterpolant({rv,cv,sv}, HU,  'linear','none');
-[Hu_r,Hu_c,Hu_s] = gradient(HU, spacing(1), spacing(2), spacing(3));
-F_Hu_r = griddedInterpolant({rv,cv,sv}, Hu_r,'linear','none');
-F_Hu_c = griddedInterpolant({rv,cv,sv}, Hu_c,'linear','none');
-F_Hu_s = griddedInterpolant({rv,cv,sv}, Hu_s,'linear','none');
-Gmag   = imgradient3(HU);
-F_Gmag = griddedInterpolant({rv,cv,sv}, Gmag,'linear','none');
+if nargin < 12
+  precomp = [];
+end
+F_HU = griddedInterpolant({rv,cv,sv}, HU, 'linear','none');
+if isstruct(precomp) && all(isfield(precomp, {'F_Hu_r','F_Hu_c','F_Hu_s','F_Gmag'}))
+  F_Hu_r = precomp.F_Hu_r;
+  F_Hu_c = precomp.F_Hu_c;
+  F_Hu_s = precomp.F_Hu_s;
+  F_Gmag = precomp.F_Gmag;
+  if isfield(precomp, 'F_HU')
+      F_HU = precomp.F_HU;
+  end
+else
+  if isstruct(precomp) && all(isfield(precomp, {'Hu_r','Hu_c','Hu_s','Gmag'}))
+      Hu_r = precomp.Hu_r;
+      Hu_c = precomp.Hu_c;
+      Hu_s = precomp.Hu_s;
+      Gmag = precomp.Gmag;
+  else
+      [Hu_r,Hu_c,Hu_s] = gradient(HU, spacing(1), spacing(2), spacing(3));
+      Gmag = imgradient3(HU);
+  end
+  F_Hu_r = griddedInterpolant({rv,cv,sv}, Hu_r,'linear','none');
+  F_Hu_c = griddedInterpolant({rv,cv,sv}, Hu_c,'linear','none');
+  F_Hu_s = griddedInterpolant({rv,cv,sv}, Hu_s,'linear','none');
+  F_Gmag = griddedInterpolant({rv,cv,sv}, Gmag,'linear','none');
+end
 [gSr,gSc,gSs] = gradient(sdf, spacing(1), spacing(2), spacing(3));
 F_sdf  = griddedInterpolant({rv,cv,sv}, sdf, 'linear','none');
 F_gSr  = griddedInterpolant({rv,cv,sv}, gSr, 'linear','none');
