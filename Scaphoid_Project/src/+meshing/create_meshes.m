@@ -63,7 +63,8 @@ if opts.UseSubvoxelOuter
                                           opts.SnapInwardCapMM, opts.SnapSDFTauMM, ...
                                           opts.SnapUseParfor);
       % Recompute per-vertex HU after snapping
-      mesh_outer.HU = sampleVolumeAtVertices(ds.HU, ds.spacing, mesh_outer.vertices);
+      F_HU = buildVolumeInterpolant(ds.HU, ds.spacing);
+      mesh_outer.HU = sampleVolumeAtVertices(F_HU, mesh_outer.vertices);
   catch ME
       outerMethod = 'binary-fallback';
       warning('Sub-voxel outer mesh failed (%s); falling back to binary isosurface.', ME.message);
@@ -119,17 +120,31 @@ verts_mm  = [verts_vox(:,2)*spacing(1), ...
            verts_vox(:,1)*spacing(2), ...
            verts_vox(:,3)*spacing(3)];
 % Per-vertex HU via trilinear interpolation (in mm space)
-perVertexHU = sampleVolumeAtVertices(HUvolume, spacing, verts_mm);
+F_HU = buildVolumeInterpolant(HUvolume, spacing);
+perVertexHU = sampleVolumeAtVertices(F_HU, verts_mm);
 mesh = struct('vertices', verts_mm, 'faces', faces);
 end
 
-function vals = sampleVolumeAtVertices(V, spacing, verts_mm)
-% Trilinear HU sampling at vertex positions (mm).
+function F = buildVolumeInterpolant(V, spacing)
+% Build an interpolant using coordinate vectors (mm).
+V = double(V);
 [R,C,S] = size(V);
-[Xmm,Ymm,Zmm] = ndgrid( (0:R-1)*spacing(1), (0:C-1)*spacing(2), (0:S-1)*spacing(3) );
-vals = interp3( Ymm, Xmm, Zmm, double(V), ...
-              verts_mm(:,2), verts_mm(:,1), verts_mm(:,3), ...
-              'linear', NaN);
+rv = (0:R-1)*spacing(1);
+cv = (0:C-1)*spacing(2);
+sv = (0:S-1)*spacing(3);
+F = griddedInterpolant({rv, cv, sv}, V, 'linear', 'none');
+end
+
+function vals = sampleVolumeAtVertices(F_or_V, spacing_or_verts, verts_mm)
+% Trilinear HU sampling at vertex positions (mm).
+if isa(F_or_V, 'griddedInterpolant')
+    F = F_or_V;
+    verts = spacing_or_verts;
+else
+    F = buildVolumeInterpolant(F_or_V, spacing_or_verts);
+    verts = verts_mm;
+end
+vals = F(verts(:,1), verts(:,2), verts(:,3));
 end
 
 function mesh = taubinSmooth(mesh, iters, lambda, mu)
