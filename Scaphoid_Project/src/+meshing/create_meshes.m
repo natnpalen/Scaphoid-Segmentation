@@ -137,27 +137,23 @@ function mesh = taubinSmooth(mesh, iters, lambda, mu)
 V = mesh.vertices; F = mesh.faces;
 if isempty(V) || isempty(F), return; end
 TR = triangulation(F, V);
-nbrs = vertexAttachments(TR); % This is a compatible way to get neighbors
-adj = cell(size(V,1),1);
-for vi = 1:size(V,1)
-  faces_i = nbrs{vi};
-  if isempty(faces_i), adj{vi} = []; continue; end
-  verts = unique(TR.ConnectivityList(faces_i(:),:));
-  adj{vi} = setdiff(verts, vi);
-end
+edges = TR.edges;
+nVerts = size(V,1);
+adjMat = sparse([edges(:,1); edges(:,2)], [edges(:,2); edges(:,1)], 1, nVerts, nVerts);
+deg = sum(adjMat, 2);
+hasNbr = deg > 0;
+invDeg = zeros(nVerts,1);
+invDeg(hasNbr) = 1 ./ deg(hasNbr);
+avgMat = spdiags(invDeg, 0, nVerts, nVerts) * adjMat;
 for t = 1:max(0,iters)
-  V = laplaceStep(V, adj, +lambda);
-  V = laplaceStep(V, adj, +mu);
+  V = laplaceStep(V, avgMat, hasNbr, +lambda);
+  V = laplaceStep(V, avgMat, hasNbr, +mu);
 end
 mesh.vertices = V;
-  function Vnext = laplaceStep(Verts, Adj, step)
+  function Vnext = laplaceStep(Verts, AvgMat, HasNbr, step)
+      avg = AvgMat * Verts;
       Vnext = Verts;
-      for k = 1:size(Verts,1)
-          nb = Adj{k};
-          if isempty(nb), continue; end
-          delta = mean(Verts(nb,:),1) - Verts(k,:);
-          Vnext(k,:) = Verts(k,:) + step * delta;
-      end
+      Vnext(HasNbr,:) = Verts(HasNbr,:) + step * (avg(HasNbr,:) - Verts(HasNbr,:));
   end
 end
 
