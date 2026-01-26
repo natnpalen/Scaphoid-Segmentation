@@ -707,17 +707,24 @@ maskSpec = false(size(HU)); maskSpec(CC.PixelIdxList{iMax}) = true;
 maskSpec = imerode(maskSpec, strel('sphere', 1));
 
 [R,C,S] = size(HU);
-[r,c,s]  = ind2sub([R,C,S], find(maskSpec));
+props = regionprops3(maskSpec, 'BoundingBox');
+bbox = props.BoundingBox(1, :); % [x y z width height depth]
+rMin = max(1, floor(bbox(2) + 0.5));
+cMin = max(1, floor(bbox(1) + 0.5));
+sMin = max(1, floor(bbox(3) + 0.5));
+rMax = min(R, ceil(bbox(2) + bbox(5) - 0.5));
+cMax = min(C, ceil(bbox(1) + bbox(4) - 0.5));
+sMax = min(S, ceil(bbox(3) + bbox(6) - 0.5));
 
 % Detect if specimen touches the full image border
-touches = any(r==1 | r==R | c==1 | c==C | s==1 | s==S);
+touches = any([rMin == 1, rMax == R, cMin == 1, cMax == C, sMin == 1, sMax == S]);
 base_margin_mm = 2.5; edge_margin_mm = 8.0;
 marg_mm = touches * edge_margin_mm + (~touches)*base_margin_mm;
 marg    = max(3, round(marg_mm / max(mean(spacing), eps)));
 
-r1 = max(1, min(r)-marg); r2 = min(R, max(r)+marg);
-c1 = max(1, min(c)-marg); c2 = min(C, max(c)+marg);
-s1 = max(1, min(s)-marg); s2 = min(S, max(s)+marg);
+r1 = max(1, rMin - marg); r2 = min(R, rMax + marg);
+c1 = max(1, cMin - marg); c2 = min(C, cMax + marg);
+s1 = max(1, sMin - marg); s2 = min(S, sMax + marg);
 
 crop = struct('rRange', r1:r2, 'cRange', c1:c2, 'sRange', s1:s2, 'specimen', maskSpec);
 HUc  = HU(crop.rRange, crop.cRange, crop.sRange);
