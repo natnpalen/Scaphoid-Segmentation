@@ -42,8 +42,8 @@ hu_max        = S.hu_max;
 % --- Load the smooth scaphoid outer shell as FV_shell (used only for optional QA/clip) ---
 FV_shell = [];
 
-% Use a short temp root to avoid long Windows paths during booleans
-short_tmp_root = fullfile('C:\','iso2mesh_tmp');         % short, stable base
+% Use a short temp root to avoid long paths during booleans
+short_tmp_root = fullfile(tempdir, 'iso2mesh_tmp');
 if ~exist(short_tmp_root,'dir'), mkdir(short_tmp_root); end
 
 % Keep analysis-scoped subdir too (optional)
@@ -111,6 +111,7 @@ lowres_data.HU = HU;
 lowres_data.scaphoid_mask = data.scaphoid_mask;
 lowres_data.ds = data.ds;
 hires_data = partition.upsample_data(lowres_data, upsamplingFactor);
+clear lowres_data HU;  % free low-res data now that upsampling is done
 fprintf('Upsampling complete. (%.2f seconds)\n', toc);
 
 n_in  = nnz(hires_data.mask);
@@ -185,7 +186,7 @@ if ~isempty(FV_shell)
         end
 
         % === Unique temp dir per iteration to avoid file collisions and long paths ===
-        iter_tmp = fullfile('C:\','iso2mesh_tmp', sprintf('w%03d', i));
+        iter_tmp = fullfile(tempdir, 'iso2mesh_tmp', sprintf('w%03d', i));
         if ~exist(iter_tmp,'dir')
             mkdir(iter_tmp);
         end

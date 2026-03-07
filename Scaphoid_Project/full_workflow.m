@@ -27,10 +27,11 @@ cfg = struct();
 cfg.mode = "single";     % <- change to "batch" to process many
 
 % Single-case input (used if cfg.mode == "single")
-cfg.single.dicomFolder = "C:\Users\natha\Downloads\Dicom Series 1-32\Scaphoid 1";
+% UPDATE THESE PATHS to point to your DICOM data location
+cfg.single.dicomFolder = fullfile(pwd, 'data', 'Scaphoid 1');
 
 % Batch input (used if cfg.mode == "batch")
-cfg.batch.topLevelFolder = "C:\Users\natha\Downloads\Dicom Series Scaphoid";
+cfg.batch.topLevelFolder = fullfile(pwd, 'data');
 
 % Common options
 cfg.mesh.upsamplingFactor = 4;        % for run_mesh_partition
@@ -50,8 +51,8 @@ cfg.features.gyroidZonedSlice     = false;
 projectRoot = fileparts(mfilename('fullpath'));
 addpath(fullfile(projectRoot, 'src'));
 
-% (Optional) use a short, stable temp base to avoid long Windows paths
-short_tmp_root = fullfile('C:\','iso2mesh_tmp');
+% (Optional) use a short, stable temp base to avoid long paths
+short_tmp_root = fullfile(tempdir, 'iso2mesh_tmp');
 if ~exist(short_tmp_root,'dir'), mkdir(short_tmp_root); end
 setenv('TMPDIR', short_tmp_root);
 setenv('TEMP',   short_tmp_root);
@@ -209,8 +210,8 @@ function cleanup_between_cases()
         end
     end
 
-    % Purge iteration-specific temp dirs created by run_mesh_partition Option B
-    baseTmp = fullfile('C:\','iso2mesh_tmp');
+    % Purge iteration-specific temp dirs created by run_mesh_partition
+    baseTmp = fullfile(tempdir, 'iso2mesh_tmp');
     if isfolder(baseTmp)
         try
             d = dir(baseTmp);
@@ -232,13 +233,7 @@ function cleanup_between_cases()
         end
     end
 
-    % Encourage MATLAB to consolidate heap
-    try
-        pack; %#ok<PACK> % may be a no-op in modern MATLAB, harmless if unsupported
-    catch
-    end
-
-    % Also good to purge Java temp refs
+    % Purge Java temp refs and flush graphics
     drawnow;
 end
 

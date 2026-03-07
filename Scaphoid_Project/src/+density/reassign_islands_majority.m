@@ -188,18 +188,20 @@ kerx = single(ones(ax,1,1));
 kery = single(ones(1,ay,1));
 kerz = single(ones(1,1,az));
 
-counts = zeros([size(Z), k], 'single');
-
-% k passes, but each pass uses 3 cheap 1-D convs instead of a full 3-D conv
-parfor lab = 1:k
+% Sequential argmax: process one label at a time to avoid a [size(Z), k] 4D array.
+% This uses ~2x volume RAM instead of ~k*volume, a major saving for large volumes.
+best_count = zeros(size(Z), 'single');
+winner     = zeros(size(Z), 'uint16');
+for lab = 1:k
     A = single(Z==lab);
-    A = convn(A, kerx, 'same');  % X
-    A = convn(A, kery, 'same');  % then Y
-    A = convn(A, kerz, 'same');  % then Z
-    counts(:,:,:,lab) = A;
+    A = convn(A, kerx, 'same');
+    A = convn(A, kery, 'same');
+    A = convn(A, kerz, 'same');
+    better = A > best_count;
+    best_count(better) = A(better);
+    winner(better) = uint16(lab);
 end
-
-[~, winner] = max(counts, [], 4);
+clear best_count;
 
 to_change = in_mask & (winner ~= Z) & (winner >= 1);
 

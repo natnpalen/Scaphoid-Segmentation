@@ -45,25 +45,46 @@ if ~isempty(reseatNote), fprintf('[Seed] %s\n', reseatNote); end
 % ---------- FIRST PASS: adaptive constraint sweep ----------
 fprintf('[Segment] Running adaptive constraint sweep...\n');
 
-constraint_sets = { ...
-    struct('name', 'Loose',  'hu_offset', 110, 'grad_prctile', 85), ...
-    struct('name', 'Medium', 'hu_offset', 135, 'grad_prctile', 89), ...
-    struct('name', 'Strict', 'hu_offset', 160, 'grad_prctile', 92)  ...
-};
+if isOsteoporotic
+    % Reduced offsets for low-density bone
+    constraint_sets = { ...
+        struct('name', 'Loose',  'hu_offset', 50,  'grad_prctile', 80), ...
+        struct('name', 'Medium', 'hu_offset', 75,  'grad_prctile', 85), ...
+        struct('name', 'Strict', 'hu_offset', 100, 'grad_prctile', 89)  ...
+    };
+else
+    constraint_sets = { ...
+        struct('name', 'Loose',  'hu_offset', 110, 'grad_prctile', 85), ...
+        struct('name', 'Medium', 'hu_offset', 135, 'grad_prctile', 89), ...
+        struct('name', 'Strict', 'hu_offset', 160, 'grad_prctile', 92)  ...
+    };
+end
 
 % Stats for thresholds
 softMed = median(double(HUc(HUc > -300)), 'omitnan'); if ~isfinite(softMed), softMed = -300; end
 vals    = double(HUc(~markerMask_c & HUc > -300 & HUc < 2000)); if isempty(vals), vals = double(HUc(isfinite(HUc))); end
 G       = imgradient3(HUc);
 
+% Detect osteoporotic scans: if median bone HU is low, use gentler thresholds
+boneVals = double(HUc(HUc > 100 & HUc < 2000 & ~markerMask_c));
+if isempty(boneVals), boneVals = vals; end
+medBone = median(boneVals, 'omitnan');
+isOsteoporotic = isfinite(medBone) && medBone < 250;
+if isOsteoporotic
+    fprintf('[Segment] Osteoporotic scan detected (median bone HU=%.0f). Using adaptive thresholds.\n', medBone);
+end
+
 % Define core and allow, with fallback if core is empty
-core_thr = max(280, min(700, prctile(vals, 94)));
+% Adaptive floors: lower for osteoporotic scans
+coreFloorHU = 180 + 100 * (~isOsteoporotic);  % 180 osteoporotic, 280 normal
+coreFallbackFloorHU = 120 + 100 * (~isOsteoporotic);  % 120 osteoporotic, 220 normal
+core_thr = max(coreFloorHU, min(700, prctile(vals, 94)));
 core     = HUc > core_thr;
 useCoreInAllow = any(core(:));
 if ~useCoreInAllow
     % Relax core threshold progressively until we get a minimal core
     for p = [92 90 88 86 84]
-        core_alt = HUc > max(220, min(650, prctile(vals, p)));
+        core_alt = HUc > max(coreFallbackFloorHU, min(650, prctile(vals, p)));
         if nnz(core_alt) > 2000
             core = core_alt; useCoreInAllow = true;
             fprintf('[Segment] Core empty at p94 — relaxed to p%d (nnz=%d)\n', p, nnz(core));
@@ -77,7 +98,9 @@ D_c = []; % keep one distance map for QC
 
 for i = 1:length(constraint_sets)
     C = constraint_sets{i};
-    HU_ALLOW_MIN = max(70,  min(220, softMed + C.hu_offset));
+    allowFloor = 40 + 30 * (~isOsteoporotic);  % 40 osteoporotic, 70 normal
+    allowCeil  = 150 + 70 * (~isOsteoporotic);  % 150 osteoporotic, 220 normal
+    HU_ALLOW_MIN = max(allowFloor, min(allowCeil, softMed + C.hu_offset));
     gThr         = prctile(G(:), C.grad_prctile);
 
     maskR = (HUc > HU_ALLOW_MIN) | (G > gThr);
@@ -132,18 +155,29 @@ lowContrast = best_score < 350;
 fprintf('[Segment] Low-contrast mode: %d (perim90=%.1f HU)\n', lowContrast, best_score);
 
 % ---------- RELAXED RETRY if surface looks like air/soft ----------
-if (~any(mask_c(:))) || best_score < 150
-    fprintf('[Segment] Surface HU looks too low (%.1f). Retrying with relaxed constraints...\n', best_score);
-    constraint_sets_relaxed = { ...
-        struct('name', 'UltraLooseA', 'hu_offset', 80, 'grad_prctile', 80), ...
-        struct('name', 'UltraLooseB', 'hu_offset', 95, 'grad_prctile', 83), ...
-        struct('name', 'UltraLooseC', 'hu_offset', 110, 'grad_prctile', 85) ...
-    };
+retryTrigger = 150 + 100 * isOsteoporotic;  % 250 for osteoporotic, 150 normal
+if (~any(mask_c(:))) || best_score < retryTrigger
+    fprintf('[Segment] Surface HU looks too low (%.1f < %.0f). Retrying with relaxed constraints...\n', best_score, retryTrigger);
+    if isOsteoporotic
+        constraint_sets_relaxed = { ...
+            struct('name', 'UltraLooseA', 'hu_offset', 30, 'grad_prctile', 75), ...
+            struct('name', 'UltraLooseB', 'hu_offset', 50, 'grad_prctile', 78), ...
+            struct('name', 'UltraLooseC', 'hu_offset', 70, 'grad_prctile', 80) ...
+        };
+    else
+        constraint_sets_relaxed = { ...
+            struct('name', 'UltraLooseA', 'hu_offset', 80, 'grad_prctile', 80), ...
+            struct('name', 'UltraLooseB', 'hu_offset', 95, 'grad_prctile', 83), ...
+            struct('name', 'UltraLooseC', 'hu_offset', 110, 'grad_prctile', 85) ...
+        };
+    end
 
     candidate_masks2 = {};
     for i = 1:length(constraint_sets_relaxed)
         C = constraint_sets_relaxed{i};
-        HU_ALLOW_MIN = max(50, min(200, softMed + C.hu_offset));
+        relaxedFloor = 30 + 20 * (~isOsteoporotic);  % 30 osteoporotic, 50 normal
+        relaxedCeil  = 120 + 80 * (~isOsteoporotic);  % 120 osteoporotic, 200 normal
+        HU_ALLOW_MIN = max(relaxedFloor, min(relaxedCeil, softMed + C.hu_offset));
         gThr         = prctile(G(:), C.grad_prctile);
         maskR        = (HUc > HU_ALLOW_MIN) | (G > gThr);
 
@@ -184,9 +218,12 @@ if (~any(mask_c(:))) || best_score < 150
 end
 
 % ---------- Last-ditch simple grow if still air-like ----------
-if (~any(mask_c(:))) || best_score < 150
+if (~any(mask_c(:))) || best_score < retryTrigger
     fprintf('[Segment] Fallback: simple region-grow from seed.\n');
-    T_lo = max(130, min(240, softMed + 140));
+    fallbackFloor = 60 + 70 * (~isOsteoporotic);  % 60 osteoporotic, 130 normal
+    fallbackCeil  = 150 + 90 * (~isOsteoporotic);  % 150 osteoporotic, 240 normal
+    fallbackOffset = 60 + 80 * (~isOsteoporotic);  % 60 osteoporotic, 140 normal
+    T_lo = max(fallbackFloor, min(fallbackCeil, softMed + fallbackOffset));
     seedDil = imdilate(seedMask_c, strel('sphere', 1));
     allowed = (HUc > T_lo) & ~imdilate(markerMask_c, strel('sphere', 2));
     mask_c  = imreconstruct(seedDil, allowed);
@@ -209,11 +246,13 @@ D_in  = bwdist(~mask_c) * voxmm;
 deep_interior = D_in >= 1.0;
 band = mask_c & ~deep_interior;
 
-softMed = median(double(HUc(HUc > -300)), 'omitnan'); if ~isfinite(softMed), softMed = -300; end
-vals = double(HUc(~markerMask_c & HUc > -300 & HUc < 2000)); if isempty(vals), vals = double(HUc(isfinite(HUc))); end
-core_thr = max(240, min(650, prctile(vals, 92)));
+% Reuse softMed/vals from above (avoid redundant computation)
+clingCoreFloor = 140 + 100 * (~isOsteoporotic);  % 140 osteoporotic, 240 normal
+core_thr = max(clingCoreFloor, min(650, prctile(vals, 92)));
 core_seed = band & (HUc > core_thr);
-HU_SUPPORT_MIN = max(60,  min(180, softMed + 90));
+supportFloor = 30 + 30 * (~isOsteoporotic);  % 30 osteoporotic, 60 normal
+supportCeil  = 120 + 60 * (~isOsteoporotic);  % 120 osteoporotic, 180 normal
+HU_SUPPORT_MIN = max(supportFloor, min(supportCeil, softMed + 90));
 gThr = prctile(G(:), 80);
 support = band & ( (HUc > HU_SUPPORT_MIN) | (G > gThr) );
 cling_band = imreconstruct(core_seed, support);
@@ -225,7 +264,9 @@ mask_c = imfill(mask_c,'holes');
 % Edge-backed perimeter prune (unchanged thresholds)
 perim = bwperim(mask_c, 26);
 band1 = imdilate(perim, strel('sphere',1));
-T_hu  = max(160, min(340, softMed + 190));
+edgePruneFloor = 100 + 60 * (~isOsteoporotic);  % 100 osteoporotic, 160 normal
+edgePruneCeil  = 220 + 120 * (~isOsteoporotic);  % 220 osteoporotic, 340 normal
+T_hu  = max(edgePruneFloor, min(edgePruneCeil, softMed + 190));
 T_g   = prctile(G(:), 70);
 kill2 = band1 & (double(HUc) < T_hu) & (G < T_g);
 if any(kill2(:))
@@ -240,7 +281,9 @@ perim  = bwperim(mask_c, 26);
 band1  = imdilate(perim, strel('sphere', 1));
 outer1 = imdilate(mask_c, strel('sphere', 1)) & ~mask_c;
 protected_core = imdilate(core, strel('sphere', 2));
-T_hi = max(170, min(360, softMed + 210));
+carveHiFloor = 100 + 70 * (~isOsteoporotic);  % 100 osteoporotic, 170 normal
+carveHiCeil  = 230 + 130 * (~isOsteoporotic);  % 230 osteoporotic, 360 normal
+T_hi = max(carveHiFloor, min(carveHiCeil, softMed + 210));
 T_lo = T_hi - 80;
 airNear = outer1 & imdilate(HUc < -300, strel('sphere',1));
 plateOK = true(size(HUc));
@@ -257,7 +300,9 @@ end
 
 % Final boundary carve
 band = imdilate(bwperim(mask_c, 26), strel('sphere', 1));
-HU_CARVE_FLOOR = max(180, min(400, softMed + 220));
+finalCarveFloor = 100 + 80 * (~isOsteoporotic);  % 100 osteoporotic, 180 normal
+finalCarveCeil  = 250 + 150 * (~isOsteoporotic);  % 250 osteoporotic, 400 normal
+HU_CARVE_FLOOR = max(finalCarveFloor, min(finalCarveCeil, softMed + 220));
 kill = band & (double(HUc) < HU_CARVE_FLOOR);
 if any(kill(:))
     mask_c(kill) = false;
@@ -519,7 +564,13 @@ else
 end
 softMed = median(double(HU(HU > -300)), 'omitnan');
 if ~isfinite(softMed), softMed = -300; end
-HU_MIN = max(180, min(400, softMed + 220));
+% Detect osteoporotic for FMM scoring
+fmmBoneVals = double(HU(HU > 100 & HU < 2000));
+fmmMedBone = median(fmmBoneVals, 'omitnan');
+fmmIsOsteo = isfinite(fmmMedBone) && fmmMedBone < 250;
+fmmMinFloor = 100 + 80 * (~fmmIsOsteo);  % 100 osteoporotic, 180 normal
+fmmMinCeil  = 250 + 150 * (~fmmIsOsteo);  % 250 osteoporotic, 400 normal
+HU_MIN = max(fmmMinFloor, min(fmmMinCeil, softMed + 220));
 penHU0  = max(0, HU_MIN - medHU0) / HU_MIN;
 penVol0 = 1e-7 * double(nnz(B_base));
 best    = s_edge0 - lambda * penHU0 - penVol0;
@@ -780,7 +831,13 @@ if ~any(seedMask(:)), return; end
 % If seed already looks like bone, keep it.
 Hseed = double(HU(seed_ijk(1), seed_ijk(2), seed_ijk(3)));
 softMed = median(double(HU(HU > -300)), 'omitnan'); if ~isfinite(softMed), softMed = -300; end
-MIN_OK = max(200, min(450, softMed + 200));
+% Adaptive seed acceptance: lower for osteoporotic scans
+reseatBoneVals = double(HU(HU > 100 & HU < 2000));
+reseatMedBone = median(reseatBoneVals, 'omitnan');
+reseatIsOsteo = isfinite(reseatMedBone) && reseatMedBone < 250;
+minOkFloor = 100 + 100 * (~reseatIsOsteo);  % 100 osteoporotic, 200 normal
+minOkCeil  = 250 + 200 * (~reseatIsOsteo);  % 250 osteoporotic, 450 normal
+MIN_OK = max(minOkFloor, min(minOkCeil, softMed + 200));
 if isfinite(Hseed) && Hseed >= MIN_OK
     return;
 end

@@ -57,9 +57,19 @@ if opts.UseSubvoxelOuter
       % 4) Taubin smoothing (shrinkage-free)
       mesh_outer = taubinSmooth(mesh_outer, opts.TaubinIters, opts.TaubinLambdaMu(1), opts.TaubinLambdaMu(2));
       % 5) Snap vertices to strongest HU gradient along normals (±band)
+      % Compute gradients and build interpolants, then clear raw arrays
       [Hu_r, Hu_c, Hu_s] = gradient(ds.HU, ds.spacing(1), ds.spacing(2), ds.spacing(3));
       Gmag = imgradient3(ds.HU);
-      huPrecomp = struct('Hu_r', Hu_r, 'Hu_c', Hu_c, 'Hu_s', Hu_s, 'Gmag', Gmag);
+      [R_hu,C_hu,S_hu] = size(ds.HU);
+      rv_hu = (0:R_hu-1)*ds.spacing(1);
+      cv_hu = (0:C_hu-1)*ds.spacing(2);
+      sv_hu = (0:S_hu-1)*ds.spacing(3);
+      huPrecomp = struct( ...
+          'F_Hu_r', griddedInterpolant({rv_hu,cv_hu,sv_hu}, Hu_r, 'linear','none'), ...
+          'F_Hu_c', griddedInterpolant({rv_hu,cv_hu,sv_hu}, Hu_c, 'linear','none'), ...
+          'F_Hu_s', griddedInterpolant({rv_hu,cv_hu,sv_hu}, Hu_s, 'linear','none'), ...
+          'F_Gmag', griddedInterpolant({rv_hu,cv_hu,sv_hu}, Gmag, 'linear','none'));
+      clear Hu_r Hu_c Hu_s Gmag rv_hu cv_hu sv_hu;  % free ~2.5 GB
       mesh_outer = snapVerticesToGradient(mesh_outer, ds.HU, ds.spacing, ...
                                           sdf_mm, opts.SnapBandMM, opts.SnapStepMM, ...
                                           opts.SnapOutwardTolMM, opts.SnapUseLikelihood, ...
@@ -233,16 +243,37 @@ F_sdf  = griddedInterpolant({rv,cv,sv}, sdf, 'linear','none');
 F_gSr  = griddedInterpolant({rv,cv,sv}, gSr, 'linear','none');
 F_gSc  = griddedInterpolant({rv,cv,sv}, gSc, 'linear','none');
 F_gSs  = griddedInterpolant({rv,cv,sv}, gSs, 'linear','none');
-% Wrap for workers
-CF_HU   = parallel.pool.Constant(F_HU);
-CF_Hu_r = parallel.pool.Constant(F_Hu_r);
-CF_Hu_c = parallel.pool.Constant(F_Hu_c);
-CF_Hu_s = parallel.pool.Constant(F_Hu_s);
-CF_Gmag = parallel.pool.Constant(F_Gmag);
-CF_sdf  = parallel.pool.Constant(F_sdf);
-CF_gSr  = parallel.pool.Constant(F_gSr);
-CF_gSc  = parallel.pool.Constant(F_gSc);
-CF_gSs  = parallel.pool.Constant(F_gSs);
+clear gSr gSc gSs sdf;  % free raw gradient arrays
+% Decide parallelism early so we only broadcast if actually using parfor
+useParfor = logical(useParfor);
+hasDCT = false; try, hasDCT = license('test','Distrib_Computing_Toolbox'); catch, end
+pp = []; if useParfor && hasDCT, pp = gcp('nocreate'); end
+useParfor = useParfor && ~isempty(pp);
+% Wrap for workers only if parfor will be used (avoids ~7 GB broadcast cost)
+if useParfor
+    CF_HU   = parallel.pool.Constant(F_HU);
+    CF_Hu_r = parallel.pool.Constant(F_Hu_r);
+    CF_Hu_c = parallel.pool.Constant(F_Hu_c);
+    CF_Hu_s = parallel.pool.Constant(F_Hu_s);
+    CF_Gmag = parallel.pool.Constant(F_Gmag);
+    CF_sdf  = parallel.pool.Constant(F_sdf);
+    CF_gSr  = parallel.pool.Constant(F_gSr);
+    CF_gSc  = parallel.pool.Constant(F_gSc);
+    CF_gSs  = parallel.pool.Constant(F_gSs);
+else
+    % Lightweight wrappers that mimic .Value access without broadcasting
+    CF_HU   = struct('Value', F_HU);
+    CF_Hu_r = struct('Value', F_Hu_r);
+    CF_Hu_c = struct('Value', F_Hu_c);
+    CF_Hu_s = struct('Value', F_Hu_s);
+    CF_Gmag = struct('Value', F_Gmag);
+    CF_sdf  = struct('Value', F_sdf);
+    CF_gSr  = struct('Value', F_gSr);
+    CF_gSc  = struct('Value', F_gSc);
+    CF_gSs  = struct('Value', F_gSs);
+end
+% Clear raw interpolant variables now that they're wrapped
+clear F_HU F_Hu_r F_Hu_c F_Hu_s F_Gmag F_sdf F_gSr F_gSc F_gSs;
 % Ensure VN points outward using grad(SDF) at vertices
 FgSr = CF_gSr.Value; FgSc = CF_gSc.Value; FgSs = CF_gSs.Value;
 gS_r = FgSr(V(:,1), V(:,2), V(:,3)); gS_r(isnan(gS_r)) = 0;
@@ -262,11 +293,7 @@ retractMM   = zeros(N,1);
 % Sampling steps along normal
 numSteps = max(1, ceil(halfBand/step));
 stepsAll = (-numSteps:numSteps) * step;
-% Decide parallelism (B1)
-useParfor = logical(useParfor);
-hasDCT = false; try, hasDCT = license('test','Distrib_Computing_Toolbox'); catch, end
-pp = []; if useParfor && hasDCT, pp = gcp('nocreate'); end
-useParfor = useParfor && ~isempty(pp);
+% Run snapping loop (parallelism already decided above)
 if useParfor
   parfor k = 1:N
       [Vnew(k,:), suspectFlag(k), retractMM(k)] = snap_one_vertex_worker( ...
@@ -325,7 +352,8 @@ ok_dir = gpar <= 0;
 % Edge magnitude
 gmag = gi_eval_const(CF_Gmag, P(:,1), P(:,2), P(:,3), -Inf);
 % Likelihood + SDF proximity weighting + HU floor
-HU_FLOOR = 260;  % hard cortical floor
+% Adaptive cortical floor: lower for osteoporotic scans
+HU_FLOOR = max(100, min(260, defMuBone * 0.6));
 if useLikelihood
   huvals = gi_eval_const(CF_HU, P(:,1), P(:,2), P(:,3), NaN);
   Rvals  = (pBone_at(huvals) ./ (pTiss_at(huvals) + eps));
