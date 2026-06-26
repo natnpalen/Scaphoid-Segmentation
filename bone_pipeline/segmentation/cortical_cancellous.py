@@ -47,10 +47,28 @@ def segment_cortical_cancellous(volume, bone_mask, spacing,
     mean_spacing = float(np.mean(spacing))
 
     # --- Density-based classification ---
-    bone_hu = volume[bone_mask]
-    bone_thresh = threshold_otsu(bone_hu)
-    high_density = bone_mask & (volume >= bone_thresh)
-    low_density = bone_mask & (volume < bone_thresh)
+    bone_hu_raw = volume[bone_mask]
+    bone_hu = bone_hu_raw[(bone_hu_raw > -100) & (bone_hu_raw < 3000)]
+
+    geometry_only = False
+    if len(bone_hu) < 100:
+        print("  Warning: too few valid bone voxels for Otsu — "
+              "using geometry-only segmentation")
+        bone_thresh = 0.0
+        geometry_only = True
+    else:
+        bone_thresh = threshold_otsu(bone_hu)
+        if bone_thresh < 50:
+            print(f"  Warning: Otsu threshold {bone_thresh:.0f} HU is "
+                  "suspiciously low — using geometry-only segmentation")
+            geometry_only = True
+
+    if geometry_only:
+        high_density = np.zeros_like(bone_mask)
+        low_density = bone_mask.copy()
+    else:
+        high_density = bone_mask & (volume >= bone_thresh)
+        low_density = bone_mask & (volume < bone_thresh)
 
     print(f"  Density threshold (Otsu): {bone_thresh:.0f} HU")
     print(f"    High-density voxels: "

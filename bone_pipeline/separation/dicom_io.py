@@ -72,6 +72,7 @@ def load_dicom_series(dicom_folder):
         volume = sitk.GetArrayFromImage(image).astype(np.float32)
 
     _apply_rescale(volume, reader, file_names)
+    _air_recalibrate(volume)
 
     sitk_spacing = image.GetSpacing()
     spacing = (sitk_spacing[2], sitk_spacing[1], sitk_spacing[0])
@@ -97,3 +98,38 @@ def _apply_rescale(volume, reader, file_names):
             print(f"  Applied rescale: slope={slope}, intercept={intercept}")
     except (RuntimeError, ValueError):
         pass
+
+
+def _air_recalibrate(volume, target_hu=-1000.0, max_offset=300.0):
+    """Shift HU so air reads ~-1000, matching MATLAB's airRecalibrateIfNeeded.
+
+    Estimates air mode from a 5-voxel border shell, then shifts the entire
+    volume so that air aligns with target_hu.  Offset is capped at
+    ±max_offset and only applied when |offset| > 10 HU.
+    """
+    sz = volume.shape
+    border = np.zeros(sz, dtype=bool)
+    border[:5, :, :] = True
+    border[-5:, :, :] = True
+    border[:, :5, :] = True
+    border[:, -5:, :] = True
+    border[:, :, :5] = True
+    border[:, :, -5:] = True
+
+    air = volume[border]
+    air = air[np.isfinite(air)]
+    if len(air) == 0:
+        return
+
+    edges = np.arange(-2000, 205, 5)
+    counts, _ = np.histogram(air, bins=edges)
+    peak_idx = int(np.argmax(counts))
+    air_mode = 0.5 * (edges[peak_idx] + edges[peak_idx + 1])
+
+    raw_offset = target_hu - air_mode
+    offset = np.sign(raw_offset) * min(abs(raw_offset), max_offset)
+
+    if abs(offset) > 10:
+        volume += offset
+        print(f"  Air recalibration: mode={air_mode:.0f} HU, "
+              f"applied offset {offset:+.0f} HU")

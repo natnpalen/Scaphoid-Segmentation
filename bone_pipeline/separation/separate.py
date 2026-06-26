@@ -149,12 +149,8 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
         allow = specimen & ~marker_dil & (
             (vol > hu_floor) | (G > g_thr))
 
-        if np.any(core):
-            cand = _reconstruct(core, allow)
-        else:
-            cand = allow
-
-        cand = _remove_tiny(cand, 500)
+        cand = _keep_bone_components(allow, core, vol, voxel_vol,
+                                     min_bone_volume_mm3)
         score = _perimeter_score(cand, vol, conn26)
 
         print(f"    {name}: hu_floor={hu_floor:.0f}, "
@@ -176,8 +172,8 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
             g_thr = float(np.percentile(specimen_G, g_pct))
             allow = specimen & ~marker_dil & (
                 (vol > hu_floor) | (G > g_thr))
-            cand = _reconstruct(core, allow) if np.any(core) else allow
-            cand = _remove_tiny(cand, 500)
+            cand = _keep_bone_components(allow, core, vol, voxel_vol,
+                                         min_bone_volume_mm3)
             score = _perimeter_score(cand, vol, conn26)
             if score > best_score or not np.any(bone_mask):
                 bone_mask, best_score = cand, score
@@ -188,19 +184,20 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
         print("    Fallback: simple threshold grow...")
         t_lo = max(130, min(240, softMed + 140))
         allowed = specimen & (vol > t_lo) & ~marker_dil
-        seed_dil = ndimage.binary_dilation(core, structure=ball(1))
-        bone_mask = _reconstruct(seed_dil, allowed) if np.any(core) else allowed
-        bone_mask = _remove_tiny(bone_mask, 200)
+        bone_mask = _keep_bone_components(allowed, core, vol, voxel_vol,
+                                          min_bone_volume_mm3)
 
     # Physical-space closing to bridge trabecular gaps, then fill interior
     bone_mask = _physical_close(bone_mask, closing_radius_mm, spacing)
 
-    # Per-slice 2D fill captures air-filled marrow cavities that
-    # reconstruction cannot reach (the key gap vs. MATLAB's FMM)
-    for z in range(bone_mask.shape[0]):
-        bone_mask[z] = ndimage.binary_fill_holes(bone_mask[z])
-    bone_mask = ndimage.binary_fill_holes(bone_mask)
+    # Per-component fill prevents merging adjacent bones.  Global
+    # binary_fill_holes can bridge air gaps between separate bones,
+    # reducing the bone count.  By filling per-component, a cavity
+    # inside bone A can't accidentally connect to bone B.
+    bone_mask = _per_component_fill(bone_mask)
     bone_mask = bone_mask & specimen
+
+    bone_mask = _clearborder_if_safe(bone_mask)
 
     print(f"    After reconstruction + closing + fill: "
           f"{np.sum(bone_mask) * voxel_vol:.0f} mm³")
@@ -228,7 +225,7 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
     # Final cleanup (no keep-largest — multi-bone)
     bone_mask = opening(bone_mask, ball(1))
     bone_mask = ndimage.binary_closing(bone_mask, structure=ball(1))
-    bone_mask = ndimage.binary_fill_holes(bone_mask)
+    bone_mask = _per_component_fill(bone_mask)
 
     min_vox = max(200, int(min_bone_volume_mm3 / voxel_vol / 2))
     bone_mask = _remove_tiny(bone_mask, min_vox)
@@ -272,6 +269,67 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 # ---------------------------------------------------------------------------
 # Helpers — morphological operations with correct physical spacing
 # ---------------------------------------------------------------------------
+
+def _clearborder_if_safe(mask, max_border_frac=0.05):
+    """Remove border-touching components only if they are a small fraction.
+
+    Mirrors MATLAB's clearborder-if-safe: if more than max_border_frac of
+    the mask touches the volume border, the specimen likely extends to the
+    edge and should be preserved.
+    """
+    total = np.sum(mask)
+    if total == 0:
+        return mask
+
+    border = np.zeros_like(mask)
+    border[0, :, :] = True
+    border[-1, :, :] = True
+    border[:, 0, :] = True
+    border[:, -1, :] = True
+    border[:, :, 0] = True
+    border[:, :, -1] = True
+
+    on_border = mask & border
+    frac = np.sum(on_border) / total
+
+    if frac >= max_border_frac:
+        return mask
+
+    labeled, n = ndimage.label(mask)
+    border_labels = set(np.unique(labeled[on_border]).tolist()) - {0}
+    if not border_labels:
+        return mask
+
+    result = mask.copy()
+    for lbl in border_labels:
+        result[labeled == lbl] = False
+    return result
+
+
+def _per_component_fill(mask):
+    """Fill holes per connected component so inter-bone gaps stay open."""
+    labeled, n = ndimage.label(mask)
+    if n == 0:
+        return mask
+    result = np.zeros_like(mask)
+    for i in range(1, n + 1):
+        comp = labeled == i
+        bbox = ndimage.find_objects(labeled, max_label=i)
+        if bbox is None or bbox[i - 1] is None:
+            result |= comp
+            continue
+        slc = bbox[i - 1]
+        pad = tuple(slice(max(s.start - 1, 0), min(s.stop + 1, d))
+                    for s, d in zip(slc, mask.shape))
+        sub = comp[pad]
+        for z in range(sub.shape[0]):
+            sub[z] = ndimage.binary_fill_holes(sub[z])
+        sub = ndimage.binary_fill_holes(sub)
+        filled = np.zeros_like(mask)
+        filled[pad] = sub
+        result |= filled
+    return result
+
 
 def _physical_close(mask, radius_mm, spacing):
     """Morphological closing with correct physical radius.
@@ -381,6 +439,39 @@ def _perimeter_score(mask, vol, conn26):
     return float(np.percentile(vol[perim], 90))
 
 
+def _keep_bone_components(allow, core, vol, voxel_vol, min_vol_mm3,
+                          hu_p90_min=150.0):
+    """Keep allow-mask components that are bone: have core seeds OR
+    meet independent volume + density criteria.
+
+    Unlike _reconstruct which only keeps components connected to core,
+    this evaluates each connected component on its own merits so that
+    separate bones without high-density core voxels are not dropped.
+    """
+    labeled, n = ndimage.label(allow)
+    if n == 0:
+        return np.zeros_like(allow, dtype=bool)
+
+    keep = np.zeros(n + 1, dtype=bool)
+    has_core = core if np.any(core) else np.zeros_like(allow, dtype=bool)
+
+    for i in range(1, n + 1):
+        comp = labeled == i
+        comp_vol = float(np.sum(comp)) * voxel_vol
+
+        if np.any(has_core & comp):
+            keep[i] = True
+            continue
+
+        if comp_vol >= min_vol_mm3:
+            comp_hu = vol[comp]
+            p90 = float(np.percentile(comp_hu, 90))
+            if p90 > hu_p90_min:
+                keep[i] = True
+
+    return keep[labeled]
+
+
 def _remove_tiny(mask, min_voxels):
     """Remove connected components smaller than *min_voxels*."""
     labeled, n = ndimage.label(mask)
@@ -461,7 +552,7 @@ def _boundary_carve(bone_mask, vol, G, spacing, softMed, core, conn26):
     protected = (ndimage.binary_dilation(core, structure=ball(2))
                  if np.any(core) else np.zeros_like(bone_mask))
 
-    T_hi = max(170, min(360, softMed + 210))
+    T_hi = max(140, min(320, softMed + 170))
     T_lo = T_hi - 80
 
     air_near = outer1 & ndimage.binary_dilation(vol < -300, structure=ball(1))
@@ -487,7 +578,7 @@ def _final_carve(bone_mask, vol, softMed, conn26):
     perim = _perimeter(bone_mask, conn26)
     band = ndimage.binary_dilation(perim, structure=ball(1))
 
-    hu_floor = max(180, min(400, softMed + 220))
+    hu_floor = max(140, min(360, softMed + 180))
     kill = band & (vol < hu_floor)
 
     if not np.any(kill):
