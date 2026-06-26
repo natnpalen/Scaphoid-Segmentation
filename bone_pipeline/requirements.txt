@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+scikit-image>=0.21
+SimpleITK>=2.3
+pydicom>=2.4
+trimesh>=4.0
+numpy-stl>=3.0

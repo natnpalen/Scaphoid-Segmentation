@@ -1,0 +1,17 @@
+{
+    "dicom_folder": "/path/to/dicom/series",
+    "output_dir": "/path/to/output",
+    "stl_shapes": [
+        "shapes/tension.stl",
+        "shapes/compression.stl",
+        "shapes/bending.stl",
+        "shapes/shear.stl"
+    ],
+    "bone_indices": null,
+    "tag_hu_min": 1500,
+    "min_bone_volume_mm3": 500.0,
+    "closing_radii_mm": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0],
+    "orientations_per_shape": 6,
+    "packing_stride": null,
+    "min_depth_mm": 0.5
+}
