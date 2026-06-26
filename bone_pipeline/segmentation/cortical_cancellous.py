@@ -1,15 +1,14 @@
 """
-Cortical vs. cancellous bone segmentation using adaptive thresholding
-and morphological endosteal boundary detection.
+Cortical vs. cancellous bone segmentation.
 
-Approach (morphological escalator):
-  1. Otsu threshold on the bone's HU values to get bone mask
-  2. Periosteal boundary = outer surface of bone mask
-  3. Iterative morphological closing with increasing kernel radius
-     fills trabecular pores, leaving only the medullary cavity
-  4. Endosteal boundary = inner surface of closed result
-  5. Cortical = between periosteal and endosteal boundaries
-  6. Cancellous = interior to endosteal boundary
+Two complementary approaches combined:
+  1. Density-based: Otsu threshold within the bone separates high-density
+     (cortical) from low-density (cancellous) voxels
+  2. Geometry-based: The cortical shell is the outer layer of the bone;
+     erosion peels it off to reveal the cancellous interior
+
+The final classification uses both: cortical = voxels in the outer shell
+OR high-density voxels; cancellous = interior voxels that are low-density.
 """
 
 import numpy as np
@@ -19,136 +18,133 @@ from skimage.morphology import ball
 
 
 def segment_cortical_cancellous(volume, bone_mask, spacing,
-                                closing_radii_mm=None,
-                                min_cortical_thickness_mm=0.3):
+                                cortical_thickness_mm=None):
     """Segment a single bone into cortical and cancellous regions.
 
     Parameters
     ----------
     volume : 3D ndarray
-        HU values for the full scan (or cropped region).
+        HU values for the full scan.
     bone_mask : 3D bool ndarray
         Binary mask of the bone to segment.
     spacing : tuple of float
         Voxel spacing (z, y, x) in mm.
-    closing_radii_mm : list of float or None
-        Radii in mm for iterative morphological closing.
-        Default: [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
-    min_cortical_thickness_mm : float
-        Minimum cortical thickness to preserve (mm).
+    cortical_thickness_mm : float or None
+        Estimated cortical shell thickness in mm. If None, auto-estimated
+        from the bone's distance transform.
 
     Returns
     -------
     dict with keys:
         'cortical_mask'   : 3D bool ndarray
         'cancellous_mask' : 3D bool ndarray
-        'endosteal_mask'  : 3D bool ndarray (the inner boundary surface)
-        'periosteal_mask' : 3D bool ndarray (the outer boundary surface)
         'bone_threshold'  : float (Otsu threshold in HU)
+        'cortical_thickness_mm' : float (used/estimated thickness)
         'cortical_volume_mm3'   : float
         'cancellous_volume_mm3' : float
     """
-    if closing_radii_mm is None:
-        closing_radii_mm = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
-
     voxel_vol_mm3 = float(np.prod(spacing))
     mean_spacing = float(np.mean(spacing))
 
+    # --- Density-based classification ---
     bone_hu = volume[bone_mask]
     bone_thresh = threshold_otsu(bone_hu)
+    high_density = bone_mask & (volume >= bone_thresh)
+    low_density = bone_mask & (volume < bone_thresh)
 
-    dense_bone = bone_mask & (volume >= bone_thresh)
+    print(f"  Density threshold (Otsu): {bone_thresh:.0f} HU")
+    print(f"    High-density voxels: "
+          f"{np.sum(high_density) * voxel_vol_mm3:.0f} mm³")
+    print(f"    Low-density voxels:  "
+          f"{np.sum(low_density) * voxel_vol_mm3:.0f} mm³")
 
-    filled = _morphological_escalator(dense_bone, bone_mask, spacing,
-                                      closing_radii_mm)
+    # --- Geometry-based: find the cortical shell via distance transform ---
+    dist = ndimage.distance_transform_edt(bone_mask, sampling=spacing)
 
-    periosteal = bone_mask.copy()
+    if cortical_thickness_mm is None:
+        cortical_thickness_mm = _estimate_cortical_thickness(
+            dist, high_density, spacing)
 
-    erosion_r = max(1, int(round(min_cortical_thickness_mm / mean_spacing)))
-    eroded_periosteal = ndimage.binary_erosion(periosteal,
-                                               structure=ball(erosion_r))
+    print(f"  Cortical thickness: {cortical_thickness_mm:.2f} mm")
 
-    endosteal_interior = filled & eroded_periosteal
+    shell_mask = bone_mask & (dist <= cortical_thickness_mm)
+    interior_mask = bone_mask & (dist > cortical_thickness_mm)
 
-    endosteal_interior = ndimage.binary_erosion(
-        endosteal_interior, structure=ball(erosion_r))
-    endosteal_interior = ndimage.binary_dilation(
-        endosteal_interior, structure=ball(erosion_r))
+    # --- Combined classification ---
+    # Cortical: in the outer shell OR high-density anywhere in the bone
+    # Cancellous: interior AND low-density
+    cortical_mask = shell_mask | high_density
+    cancellous_mask = interior_mask & low_density
 
-    cancellous_mask = (~filled) & bone_mask & (~dense_bone)
+    # Clean up small isolated cancellous patches
+    cancellous_mask = _remove_small_components(
+        cancellous_mask, min_volume_mm3=1.0, voxel_vol_mm3=voxel_vol_mm3)
 
-    cancellous_mask = cancellous_mask | (bone_mask & (~filled))
-
-    cancellous_mask = _keep_interior_cancellous(cancellous_mask, bone_mask,
-                                                spacing)
-
+    # Anything in bone_mask not cancellous is cortical
     cortical_mask = bone_mask & (~cancellous_mask)
 
     cortical_vol = float(np.sum(cortical_mask)) * voxel_vol_mm3
     cancellous_vol = float(np.sum(cancellous_mask)) * voxel_vol_mm3
+    total = cortical_vol + cancellous_vol
 
-    print(f"Segmentation: threshold={bone_thresh:.0f} HU")
-    print(f"  Cortical:   {cortical_vol:.1f} mm³ "
-          f"({100*cortical_vol/(cortical_vol+cancellous_vol):.1f}%)")
-    print(f"  Cancellous: {cancellous_vol:.1f} mm³ "
-          f"({100*cancellous_vol/(cortical_vol+cancellous_vol):.1f}%)")
+    if total > 0:
+        print(f"  Cortical:   {cortical_vol:.1f} mm³ "
+              f"({100 * cortical_vol / total:.1f}%)")
+        print(f"  Cancellous: {cancellous_vol:.1f} mm³ "
+              f"({100 * cancellous_vol / total:.1f}%)")
+    else:
+        print("  Warning: no bone volume detected")
 
     return {
         'cortical_mask': cortical_mask,
         'cancellous_mask': cancellous_mask,
-        'endosteal_mask': endosteal_interior,
-        'periosteal_mask': periosteal,
         'bone_threshold': bone_thresh,
+        'cortical_thickness_mm': cortical_thickness_mm,
         'cortical_volume_mm3': cortical_vol,
         'cancellous_volume_mm3': cancellous_vol,
     }
 
 
-def _morphological_escalator(dense_bone, bone_mask, spacing, radii_mm):
-    """Iterative morphological closing to fill trabecular pores.
+def _estimate_cortical_thickness(dist, high_density_mask, spacing):
+    """Estimate cortical thickness from the distance transform.
 
-    Progressively closes the dense bone mask with increasing kernel radii.
-    At each step, the result is intersected with the bone mask to stay
-    within the periosteal boundary.
+    Looks at how deep into the bone high-density voxels extend from the
+    surface. The cortical shell thickness is estimated as the depth at
+    which the fraction of high-density voxels drops below 50%.
     """
-    mean_spacing = float(np.mean(spacing))
-    result = dense_bone.copy()
+    max_dist = float(dist.max())
+    if max_dist == 0:
+        return float(np.mean(spacing))
 
-    for radius_mm in sorted(radii_mm):
-        radius_vox = max(1, int(round(radius_mm / mean_spacing)))
-        selem = ball(radius_vox)
+    # Sample density fraction at increasing depths
+    n_bins = max(10, int(max_dist / float(np.min(spacing))))
+    edges = np.linspace(0, max_dist, n_bins + 1)
 
-        closed = ndimage.binary_closing(result, structure=selem)
-        closed = ndimage.binary_fill_holes(closed)
+    for i in range(len(edges) - 1):
+        band = (dist >= edges[i]) & (dist < edges[i + 1])
+        band_voxels = np.sum(band)
+        if band_voxels == 0:
+            continue
+        high_frac = np.sum(band & high_density_mask) / band_voxels
+        if high_frac < 0.5:
+            thickness = edges[i]
+            return max(thickness, float(np.mean(spacing)))
 
-        result = closed & bone_mask
+    # If high-density throughout, use 20% of max depth
+    return max(0.2 * max_dist, float(np.mean(spacing)))
 
-    return result
 
-
-def _keep_interior_cancellous(cancellous_mask, bone_mask, spacing):
-    """Remove cancellous regions that touch the periosteal surface.
-
-    True cancellous bone is interior; small patches at the surface are
-    likely noise or thin cortical regions misclassified.
-    """
-    mean_spacing = float(np.mean(spacing))
-
-    surface_thickness = max(1, int(round(0.5 / mean_spacing)))
-    eroded = ndimage.binary_erosion(bone_mask,
-                                    structure=ball(surface_thickness))
-    surface_band = bone_mask & (~eroded)
-
-    labeled, n = ndimage.label(cancellous_mask)
+def _remove_small_components(mask, min_volume_mm3, voxel_vol_mm3):
+    """Remove connected components smaller than min_volume_mm3."""
+    labeled, n = ndimage.label(mask)
     if n == 0:
-        return cancellous_mask
+        return mask
 
-    cleaned = cancellous_mask.copy()
+    cleaned = mask.copy()
     for i in range(1, n + 1):
         component = labeled == i
-        surface_overlap = np.sum(component & surface_band)
-        total_voxels = np.sum(component)
-        if surface_overlap / max(total_voxels, 1) > 0.5:
+        vol = np.sum(component) * voxel_vol_mm3
+        if vol < min_volume_mm3:
             cleaned[component] = False
 
     return cleaned

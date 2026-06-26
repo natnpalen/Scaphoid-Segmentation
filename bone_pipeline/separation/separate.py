@@ -3,11 +3,12 @@ Bone separation module: isolates individual bones from a multi-bone CT scan.
 
 Pipeline:
   1. Load DICOM series into a 3D HU volume
-  2. Two-pass thresholding: first exclude metal tags, then Otsu on bone
-  3. Connected component labeling to identify distinct objects
-  4. Classify components as bone vs. lead tag by size and HU
-  5. Associate each tag with its nearest bone by proximity
-  6. Return labeled bone volumes with tag-based identifiers
+  2. Two-pass thresholding: exclude metal, then Otsu on tissue
+  3. Morphological closing to bridge trabecular gaps within bones
+  4. Connected component labeling to identify distinct objects
+  5. Classify components as bone vs. lead tag by size and HU
+  6. Associate each tag with its nearest bone by proximity
+  7. Return labeled bone volumes with tag-based identifiers
 """
 
 import numpy as np
@@ -15,12 +16,13 @@ from pathlib import Path
 from scipy import ndimage
 from skimage.filters import threshold_otsu
 from skimage.measure import regionprops
+from skimage.morphology import ball
 
 from .dicom_io import load_dicom_series
 
 
-def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
-                   metal_hu_cap=3000):
+def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=200.0,
+                   metal_hu_cap=3000, closing_radius_mm=2.0):
     """Separate individual bones from a multi-bone DICOM CT scan.
 
     Parameters
@@ -32,8 +34,11 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
     min_bone_volume_mm3 : float
         Minimum volume in mm^3 for a component to be considered a bone.
     metal_hu_cap : float
-        HU values above this are excluded from Otsu thresholding to prevent
-        metal tags from skewing the bone threshold upward.
+        HU values above this are excluded from Otsu thresholding.
+    closing_radius_mm : float
+        Morphological closing radius in mm. Bridges internal gaps
+        (trabecular voids, marrow spaces) so each bone stays as one
+        connected component.
 
     Returns
     -------
@@ -58,9 +63,10 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
             f"Check DICOM series selection.")
 
     voxel_vol_mm3 = float(np.prod(spacing))
+    mean_spacing = float(np.mean(spacing))
 
+    # --- Thresholding ---
     # Exclude air (< -500) AND metal tags (> metal_hu_cap) from Otsu
-    # so dense tags don't pull the threshold above bone tissue
     tissue = volume[(volume > -500) & (volume < metal_hu_cap)]
     if len(tissue) == 0:
         tissue = volume[volume > -500]
@@ -68,20 +74,32 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
         tissue = volume.ravel()
 
     bone_thresh = threshold_otsu(tissue)
-
-    # Bone mask includes everything above Otsu threshold (bone + tags)
     bone_mask = volume > bone_thresh
+
+    print(f"  Otsu threshold: {bone_thresh:.0f} HU "
+          f"(metal capped at {metal_hu_cap})")
+    print(f"  Raw mask volume: {np.sum(bone_mask) * voxel_vol_mm3:.0f} mm³")
+
+    # --- Morphological closing to bridge trabecular gaps ---
+    closing_r_vox = max(1, int(round(closing_radius_mm / mean_spacing)))
+    selem = ball(closing_r_vox)
+    print(f"  Closing radius: {closing_radius_mm} mm "
+          f"({closing_r_vox} voxels), bridging internal gaps...")
+
+    bone_mask = ndimage.binary_closing(bone_mask, structure=selem)
     bone_mask = ndimage.binary_fill_holes(bone_mask)
 
+    print(f"  Closed mask volume: {np.sum(bone_mask) * voxel_vol_mm3:.0f} mm³")
+
+    # --- Connected component labeling ---
     labeled, n_components = ndimage.label(bone_mask)
-    print(f"  Otsu threshold: {bone_thresh:.0f} HU "
-          f"(metal capped at {metal_hu_cap}), "
-          f"{n_components} components found")
+    print(f"  {n_components} components after closing")
 
     props = regionprops(labeled, intensity_image=volume)
 
     bones = []
     tags = []
+    small_count = 0
 
     for prop in props:
         vol_mm3 = prop.area * voxel_vol_mm3
@@ -104,7 +122,14 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
                 'volume_mm3': vol_mm3,
                 'mean_hu': mean_hu,
             })
+        else:
+            small_count += 1
 
+    if small_count > 0:
+        print(f"  Filtered out {small_count} small components "
+              f"(< {min_bone_volume_mm3} mm³)")
+
+    # --- Tag-to-bone association ---
     for bone in bones:
         bone['tag_id'] = None
         bone['tag_dist'] = None
