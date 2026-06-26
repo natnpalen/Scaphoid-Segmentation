@@ -48,14 +48,21 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0):
     dicom_folder = Path(dicom_folder)
     volume, spacing = load_dicom_series(dicom_folder)
 
+    if volume.ndim != 3:
+        raise ValueError(
+            f"Expected 3D volume, got shape {volume.shape}. "
+            f"Check DICOM series selection.")
+
     voxel_vol_mm3 = float(np.prod(spacing))
 
-    thresh = threshold_otsu(volume[volume > -500])
+    foreground = volume[volume > -500] if np.any(volume < -500) else volume.ravel()
+    thresh = threshold_otsu(foreground)
     bone_mask = volume > thresh
 
     bone_mask = ndimage.binary_fill_holes(bone_mask)
 
     labeled, n_components = ndimage.label(bone_mask)
+    print(f"  Otsu threshold: {thresh:.0f}, {n_components} components found")
     props = regionprops(labeled, intensity_image=volume)
 
     bones = []
