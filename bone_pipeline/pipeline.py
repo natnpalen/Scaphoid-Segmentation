@@ -55,7 +55,8 @@ def run_pipeline(config):
     sep_result = separate_bones(
         dicom_folder,
         tag_hu_min=config.get('tag_hu_min', 1500),
-        min_bone_volume_mm3=config.get('min_bone_volume_mm3', 500.0),
+        min_bone_volume_mm3=config.get('min_bone_volume_mm3', 200.0),
+        closing_radius_mm=config.get('closing_radius_mm', 2.0),
     )
 
     volume = sep_result['volume']
@@ -77,7 +78,7 @@ def run_pipeline(config):
               f"({bone['volume_mm3']:.0f} mm³)...")
         seg = segment_cortical_cancellous(
             volume, bone['mask'], spacing,
-            closing_radii_mm=config.get('closing_radii_mm'),
+            cortical_thickness_mm=config.get('cortical_thickness_mm'),
         )
         segmentations.append(seg)
 
