@@ -6,6 +6,7 @@ Runs the full pipeline:
   2. Segment each bone into cortical and cancellous regions
   3. Pack mechanical testing specimens into each region
   4. Export all results as DICOM series
+  5. Generate diagnostic visualizations
 """
 
 import argparse
@@ -16,6 +17,9 @@ from .separation import separate_bones
 from .segmentation import segment_cortical_cancellous
 from .packing import pack_specimens
 from .export.dicom_export import export_all_results
+from .visualization import (visualize_separation, visualize_segmentation,
+                             visualize_hu_histogram,
+                             visualize_full_volume_histogram)
 
 
 def run_pipeline(config):
@@ -28,11 +32,11 @@ def run_pipeline(config):
             'dicom_folder'  : str, path to input DICOM series
             'output_dir'    : str, path for output
             'stl_shapes'    : list of str, paths to specimen STL files
-            'bone_indices'  : list of int or None, which bones to process
-                              (None = all)
-            'tag_hu_min'    : float, min HU for lead tag detection (default 1500)
-            'min_bone_volume_mm3' : float (default 500)
-            'closing_radii_mm'    : list of float or None
+            'bone_indices'  : list of int or None (default: all)
+            'tag_hu_min'    : float (default 1500)
+            'min_bone_volume_mm3' : float (default 200)
+            'closing_radius_mm'   : float (default 2.0)
+            'cortical_thickness_mm' : float or None (auto)
             'orientations_per_shape' : int (default 6)
             'packing_stride'      : int or None (auto)
             'min_depth_mm'        : float (default 0.5)
@@ -46,6 +50,8 @@ def run_pipeline(config):
     stl_paths = [Path(p) for p in config['stl_shapes']]
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    viz_dir = output_dir / 'diagnostics'
+    viz_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Stage 1: Bone separation ---
     print("=" * 60)
@@ -63,9 +69,17 @@ def run_pipeline(config):
     spacing = sep_result['spacing']
     bones = sep_result['bones']
 
+    # Diagnostic: full volume histogram
+    print("\nGenerating volume histogram...")
+    visualize_full_volume_histogram(volume, output_dir=viz_dir)
+
     bone_indices = config.get('bone_indices')
     if bone_indices is not None:
         bones = [bones[i] for i in bone_indices if i < len(bones)]
+
+    # Diagnostic: separation overview
+    print("Generating separation overview...")
+    visualize_separation(volume, spacing, bones, output_dir=viz_dir)
 
     # --- Stage 2: Cortical/cancellous segmentation ---
     print("\n" + "=" * 60)
@@ -81,6 +95,13 @@ def run_pipeline(config):
             cortical_thickness_mm=config.get('cortical_thickness_mm'),
         )
         segmentations.append(seg)
+
+        # Diagnostic: per-bone histogram and segmentation view
+        visualize_hu_histogram(volume, bone['mask'], bone_index=i,
+                               output_dir=viz_dir)
+        visualize_segmentation(volume, spacing, bone['mask'],
+                                seg['cortical_mask'], seg['cancellous_mask'],
+                                bone_index=i, output_dir=viz_dir)
 
     # --- Stage 3: Specimen packing ---
     print("\n" + "=" * 60)
@@ -115,6 +136,8 @@ def run_pipeline(config):
 
     # --- Summary ---
     _print_summary(bones, segmentations, packings)
+
+    print(f"\nDiagnostic images saved to {viz_dir}")
 
     return {
         'separation': sep_result,
