@@ -3,7 +3,7 @@ Bone separation — faithful port of the scaphoid pipeline's segmentation
 strategy (+segment/run_segmentation.m).
 
 Pipeline stages:
-  1. Specimen isolation (non-air, largest component)
+  1. Specimen isolation (non-air, all significant components)
   2. Marker detection with Gaussian falloff artifact weighting
   3. Adaptive constraint sweep: Loose/Medium/Strict (HU-offset, grad-percentile)
      pairs each produce a candidate via morphological reconstruction through
@@ -21,7 +21,7 @@ import numpy as np
 from pathlib import Path
 from scipy import ndimage
 from skimage.measure import regionprops
-from skimage.morphology import ball, binary_opening
+from skimage.morphology import ball, opening
 
 from .dicom_io import load_dicom_series
 
@@ -72,11 +72,14 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 
     # === Stage 2: Marker & artifact detection ===
     print("  Stage 2: Marker & artifact detection...")
-    lead_mask = specimen & (vol > tag_hu_min)
+    # Detect tags in the FULL volume — they may be in separate non-air
+    # components from the bones (the scaphoid pipeline only had one bone,
+    # so restricting to specimen was fine; for multi-bone it drops tags).
+    lead_mask = vol > tag_hu_min
     marker_mask = lead_mask.copy()
     if np.any(lead_mask):
         near_lead = ndimage.binary_dilation(lead_mask, structure=ball(2))
-        flags = specimen & (vol >= 200) & (vol <= 700) & near_lead
+        flags = (vol >= 200) & (vol <= 700) & near_lead
         marker_mask = marker_mask | flags
 
     if np.any(marker_mask):
@@ -208,7 +211,7 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
     bone_mask = _final_carve(bone_mask, vol, softMed, conn26)
 
     # Final cleanup (no keep-largest — we want multiple bones)
-    bone_mask = binary_opening(bone_mask, ball(1))
+    bone_mask = opening(bone_mask, ball(1))
     bone_mask = ndimage.binary_closing(bone_mask, structure=ball(1))
     bone_mask = ndimage.binary_fill_holes(bone_mask)
 
@@ -256,15 +259,22 @@ def separate_bones(dicom_folder, tag_hu_min=1200, min_bone_volume_mm3=200.0,
 # ---------------------------------------------------------------------------
 
 def _isolate_specimen(vol, spacing):
-    """Largest non-air connected component (matches MATLAB buildSpecimenCrop)."""
+    """All non-air material after generous closing and hole-filling.
+
+    The MATLAB scaphoid pipeline takes only the largest non-air component
+    because it segments a single bone.  For multi-bone scans the bones are
+    separated by air, so we keep ALL significant non-air components.  A
+    generous closing (2 mm radius) bridges internal trabecular porosity so
+    each bone forms a single connected region.
+    """
     non_air = vol > -500
-    r = max(1, int(round(0.6 / np.mean(spacing))))
+    r = max(2, int(round(2.0 / np.mean(spacing))))
     non_air = ndimage.binary_closing(non_air, structure=ball(r))
-    labeled, n = ndimage.label(non_air)
-    if n == 0:
-        return non_air
-    sizes = ndimage.sum(non_air, labeled, range(1, n + 1))
-    return labeled == (int(np.argmax(sizes)) + 1)
+    non_air = ndimage.binary_fill_holes(non_air)
+    voxel_vol = float(np.prod(spacing))
+    min_vox = max(100, int(50.0 / voxel_vol))
+    non_air = _remove_tiny(non_air, min_vox)
+    return non_air
 
 
 def _find_tags(lead_mask, spacing, voxel_vol):
