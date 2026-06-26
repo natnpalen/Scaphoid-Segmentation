@@ -3,7 +3,7 @@ Bone separation module: isolates individual bones from a multi-bone CT scan.
 
 Pipeline:
   1. Load DICOM series into a 3D HU volume
-  2. Otsu threshold to create binary bone mask
+  2. Two-pass thresholding: first exclude metal tags, then Otsu on bone
   3. Connected component labeling to identify distinct objects
   4. Classify components as bone vs. lead tag by size and HU
   5. Associate each tag with its nearest bone by proximity
@@ -19,7 +19,8 @@ from skimage.measure import regionprops
 from .dicom_io import load_dicom_series
 
 
-def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0):
+def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0,
+                   metal_hu_cap=3000):
     """Separate individual bones from a multi-bone DICOM CT scan.
 
     Parameters
@@ -27,9 +28,12 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0):
     dicom_folder : str or Path
         Path to folder containing DICOM files for one scan.
     tag_hu_min : float
-        Minimum HU to consider a component a lead tag (default 1500).
+        Minimum mean HU to consider a component a lead tag (default 1500).
     min_bone_volume_mm3 : float
         Minimum volume in mm^3 for a component to be considered a bone.
+    metal_hu_cap : float
+        HU values above this are excluded from Otsu thresholding to prevent
+        metal tags from skewing the bone threshold upward.
 
     Returns
     -------
@@ -55,14 +59,25 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0):
 
     voxel_vol_mm3 = float(np.prod(spacing))
 
-    foreground = volume[volume > -500] if np.any(volume < -500) else volume.ravel()
-    thresh = threshold_otsu(foreground)
-    bone_mask = volume > thresh
+    # Exclude air (< -500) AND metal tags (> metal_hu_cap) from Otsu
+    # so dense tags don't pull the threshold above bone tissue
+    tissue = volume[(volume > -500) & (volume < metal_hu_cap)]
+    if len(tissue) == 0:
+        tissue = volume[volume > -500]
+    if len(tissue) == 0:
+        tissue = volume.ravel()
 
+    bone_thresh = threshold_otsu(tissue)
+
+    # Bone mask includes everything above Otsu threshold (bone + tags)
+    bone_mask = volume > bone_thresh
     bone_mask = ndimage.binary_fill_holes(bone_mask)
 
     labeled, n_components = ndimage.label(bone_mask)
-    print(f"  Otsu threshold: {thresh:.0f}, {n_components} components found")
+    print(f"  Otsu threshold: {bone_thresh:.0f} HU "
+          f"(metal capped at {metal_hu_cap}), "
+          f"{n_components} components found")
+
     props = regionprops(labeled, intensity_image=volume)
 
     bones = []
@@ -70,7 +85,7 @@ def separate_bones(dicom_folder, tag_hu_min=1500, min_bone_volume_mm3=500.0):
 
     for prop in props:
         vol_mm3 = prop.area * voxel_vol_mm3
-        mean_hu = prop.mean_intensity
+        mean_hu = float(prop.intensity_mean)
 
         if mean_hu >= tag_hu_min and vol_mm3 < min_bone_volume_mm3:
             tags.append({
