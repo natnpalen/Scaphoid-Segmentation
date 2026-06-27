@@ -4,17 +4,9 @@ function result = separate_bones(ds, opts)
 %   result = bone.separate_bones(ds, opts)
 %
 % For excised specimens scanned in air, the non-air non-tag region IS the
-% bone.  This function finds the specimen envelope, removes lead tags, and
-% splits into connected components — one per bone.
-%
-% Inputs
-%   ds   : dataset struct from dicom.series_load
-%   opts : options struct with fields TagHUMin, MinBoneVolMM3, ClosingRadiusMM
-%
-% Output  result  struct with fields:
-%   .bones      : cell array of structs, one per bone
-%   .specimen   : logical 3D mask of all non-air material
-%   .n_tags     : number of detected tags
+% bone.  Uses the scaphoid pipeline's proven marker detection strategy:
+% lead cores (HU>1200) plus flag collars (HU 200-700 near lead), with
+% Gaussian artifact weighting.
 
 vol = double(ds.HU);
 spacing = ds.spacing;
@@ -26,23 +18,39 @@ specimen = isolate_specimen(vol, spacing, opts.ClosingRadiusMM);
 fprintf('    Specimen: %.0f mm^3 (%d voxels)\n', ...
     sum(specimen(:))*voxel_vol, sum(specimen(:)));
 
-% ---- Stage 2: Tag detection ----
-fprintf('  [Separate] Stage 2: Tag detection...\n');
-lead_mask = vol > opts.TagHUMin;
-tags = find_tags(lead_mask, spacing, voxel_vol);
-fprintf('    Found %d metal tags\n', numel(tags));
+% ---- Stage 2: Marker & artifact detection (scaphoid pipeline approach) ----
+fprintf('  [Separate] Stage 2: Marker & artifact detection...\n');
+[marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.MarkerRangeHU, ...
+    opts.ArtifactSigmaMM, spacing);
 
-if any(lead_mask(:))
-    % Anisotropy-aware distance: build ellipsoidal exclusion
-    tag_dist_mm = aniso_distance_mm(lead_mask, spacing);
-    tag_exclusion = tag_dist_mm < 1.0;
-else
-    tag_exclusion = false(size(vol));
+% Dilate marker mask for exclusion (scaphoid pipeline uses sphere(2))
+marker_excl = imdilate(marker_mask, strel('sphere', 3));
+
+% Count actual lead tags (real tags are big enough, not streak artifacts)
+lead_core = vol > opts.TagHUMin;
+CC_tags = bwconncomp(lead_core, 26);
+min_tag_vox = max(5, round(2.0 / voxel_vol));  % at least 2 mm^3
+real_tags = {};
+for i = 1:CC_tags.NumObjects
+    if numel(CC_tags.PixelIdxList{i}) >= min_tag_vox
+        [rr, cc, ss] = ind2sub(size(vol), CC_tags.PixelIdxList{i});
+        tag = struct();
+        tag.label = numel(real_tags) + 1;
+        tag.centroid_mm = [mean(rr) mean(cc) mean(ss)] .* spacing;
+        tag.volume_mm3 = numel(CC_tags.PixelIdxList{i}) * voxel_vol;
+        real_tags{end+1} = tag; %#ok<AGROW>
+    end
 end
+fprintf('    Marker mask: %d voxels, %d real tags (>%.0f mm^3)\n', ...
+    sum(marker_mask(:)), numel(real_tags), 2.0);
 
 % ---- Stage 3: Bone envelope detection ----
 fprintf('  [Separate] Stage 3: Bone envelope detection...\n');
-bone_region = specimen & ~tag_exclusion;
+
+% Bone = specimen minus markers and their proximity
+bone_region = specimen & ~marker_excl;
+
+% Split into connected components
 CC = bwconncomp(bone_region, 26);
 fprintf('    Raw bone region: %.0f mm^3, %d components\n', ...
     sum(bone_region(:))*voxel_vol, CC.NumObjects);
@@ -71,13 +79,6 @@ for i = 1:CC.NumObjects
         continue;
     end
 
-    mean_hu = mean(vol(comp));
-    if mean_hu > opts.TagHUMin
-        fprintf('    Component %d: %.0f mm^3 — skipped (mean HU %.0f, likely tag)\n', ...
-            i, comp_vol, mean_hu);
-        continue;
-    end
-
     % Per-slice 2D fill captures enclosed marrow cavities
     filled = comp;
     for z = 1:size(filled, 3)
@@ -87,7 +88,9 @@ for i = 1:CC.NumObjects
         end
     end
     filled = imfill(filled, 'holes');
-    filled = filled & specimen;
+
+    % Stay within specimen AND away from markers
+    filled = filled & specimen & ~marker_excl;
 
     filled_vol = sum(filled(:)) * voxel_vol;
     filled_hu = mean(vol(filled));
@@ -123,14 +126,14 @@ if small_count > 0
 end
 
 % ---- Stage 5: Tag association ----
-associate_tags(bones, tags);
+associate_tags(bones, real_tags);
 
 % Sort by volume (largest first)
 vols = cellfun(@(b) b.volume_mm3, bones);
 [~, order] = sort(vols, 'descend');
 bones = bones(order);
 
-fprintf('\n  Found %d bones and %d tags in scan\n', numel(bones), numel(tags));
+fprintf('\n  Found %d bones and %d tags in scan\n', numel(bones), numel(real_tags));
 for i = 1:numel(bones)
     b = bones{i};
     if ~isempty(b.tag_id)
@@ -145,7 +148,9 @@ end
 result = struct();
 result.bones = bones;
 result.specimen = specimen;
-result.n_tags = numel(tags);
+result.marker_mask = marker_mask;
+result.artifact_weight = artifact_w;
+result.n_tags = numel(real_tags);
 end
 
 
@@ -169,8 +174,6 @@ end
 
 
 function closed = physical_close(mask, radius_mm, spacing)
-    % Morphological closing with a true spherical structuring element
-    % that accounts for anisotropic voxel spacing.
     radius_vox = ceil(radius_mm ./ spacing);
     [Y, X, Z] = ndgrid(-radius_vox(1):radius_vox(1), ...
                         -radius_vox(2):radius_vox(2), ...
@@ -181,33 +184,18 @@ function closed = physical_close(mask, radius_mm, spacing)
 end
 
 
-function d_mm = aniso_distance_mm(BW, spacing)
-    % Approximate anisotropic Euclidean distance in mm.
-    % Rescale to isotropic, compute bwdist, scale back.
-    iso = min(spacing);
-    scale = spacing ./ iso;
-    sz_new = round(size(BW) .* scale);
-    BW_iso = imresize3(uint8(BW), sz_new, 'nearest') > 0;
-    d_iso = bwdist(BW_iso) * iso;
-    d_mm = imresize3(single(d_iso), size(BW), 'linear');
-end
+function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, marker_range, sigma_mm, spacing)
+    % Scaphoid pipeline's marker detection strategy:
+    % Lead cores (HU > 1200) plus flag collars (HU in marker_range near lead)
+    lead = HU > 1200;
+    flags = (HU >= marker_range(1) & HU <= marker_range(2)) & ...
+            imdilate(lead, strel('sphere', 2));
+    marker_mask = lead | flags;
 
-
-function tags = find_tags(lead_mask, spacing, voxel_vol)
-    tags = {};
-    if ~any(lead_mask(:)), return; end
-    CC = bwconncomp(lead_mask, 26);
-    for i = 1:CC.NumObjects
-        comp = false(size(lead_mask));
-        comp(CC.PixelIdxList{i}) = true;
-        [rr, cc, ss] = ind2sub(size(lead_mask), CC.PixelIdxList{i});
-        tag = struct();
-        tag.label = i;
-        tag.cc_idx = i;
-        tag.centroid_mm = [mean(rr) mean(cc) mean(ss)] .* spacing;
-        tag.volume_mm3 = numel(CC.PixelIdxList{i}) * voxel_vol;
-        tags{end+1} = tag; %#ok<AGROW>
-    end
+    % Gaussian distance falloff for artifact weighting
+    d_vox = bwdist(marker_mask);
+    d_mm = d_vox * mean(spacing);
+    artifact_w = exp(-(d_mm / sigma_mm).^2);
 end
 
 

@@ -44,12 +44,14 @@ for si = 1:n_shapes
     for oi = 1:size(rotations, 3)
         try
             [shape_mask, ~] = bone.voxelize_stl(stl_paths{si}, spacing);
-            % Apply rotation
             if oi > 1
                 shape_mask = rotate_mask_3d(shape_mask, rotations(:,:,oi));
             end
             shape_vol = sum(shape_mask(:)) * voxel_vol;
-            if shape_vol < 0.1, continue; end
+            if shape_vol < 0.1
+                fprintf('(empty voxelization) ');
+                continue;
+            end
 
             cand = struct();
             cand.shape_idx = si;
@@ -59,7 +61,10 @@ for si = 1:n_shapes
             cand.volume_mm3 = shape_vol;
             cand.size_vox = size(shape_mask);
             candidates{end+1} = cand; %#ok<AGROW>
-        catch
+        catch ME
+            if oi == 1
+                fprintf('(error: %s) ', ME.message);
+            end
             continue;
         end
     end
