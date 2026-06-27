@@ -200,7 +200,17 @@ for si = 1:numel(seeds)
         continue;
     end
 
-    fprintf('      After seal: %d voxels (%.0f mm^3)\n', ...
+    % Remove marker material AFTER sealing (imclose can re-bridge)
+    mask_bone_L = mask_bone_L & ~mk_L & ~lead_L;
+    mask_bone_L = imfill(mask_bone_L, 'holes');
+    mask_bone_L = keep_largest_3d(mask_bone_L);
+
+    if ~any(mask_bone_L(:))
+        fprintf('      -> empty after marker carve, skipped\n');
+        continue;
+    end
+
+    fprintf('      After seal+carve: %d voxels (%.0f mm^3)\n', ...
         nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Paste back to full volume
@@ -519,24 +529,27 @@ end
 %  (~700-1200 HU near lead), and light flags/housing (200-700 HU near lead).
 % =========================================================================
 function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, sigma_mm, spacing)
-    % Lead letter cores: HU > 3000 (actual lead is 4000-7000 HU, 3000 catches
-    % partial-volume edges; 1200 was wrong — dense cortical bone is 1200-2000)
+    % Lead letter cores: HU > 3000 (actual lead is 4000-7000 HU)
     lead = HU > 3000;
 
-    % Dense flags/tabs: 1000-3000 HU within 3 voxels of actual lead
-    dense_flags = (HU >= 1000 & HU <= 3000) & imdilate(lead, strel('sphere', 3));
+    % Flood-fill from lead through all connected non-air material.
+    % This captures the ENTIRE marker assembly (lead + flags + housing)
+    % regardless of exact HU values, because the assembly is one
+    % connected piece surrounded by air. Stops at air gaps naturally.
+    non_air = HU > -200;
+    non_air = imclose(non_air, strel('sphere', 1));
+    if any(lead(:))
+        marker_flood = imreconstruct(lead, non_air);
+    else
+        marker_flood = false(size(HU));
+    end
 
-    % Light flags/housing: 200-1000 HU within 2 voxels of lead+dense
-    lead_plus_dense = lead | dense_flags;
-    light_flags = (HU >= 200 & HU <= 1000) & imdilate(lead_plus_dense, strel('sphere', 2));
+    % Separate into core (lead + dense flag, >1000 HU) and full assembly
+    marker_core = marker_flood & (HU > 1000);
+    marker_mask = marker_flood;
 
-    marker_mask = lead | dense_flags | light_flags;
-
-    % Core = lead + dense flags only (safe to hard-carve)
-    marker_core = lead | dense_flags;
-
-    fprintf('    Marker layers: lead=%d, dense_flags=%d, light_flags=%d, total=%d voxels\n', ...
-        nnz(lead), nnz(dense_flags), nnz(light_flags), nnz(marker_mask));
+    fprintf('    Marker detection: lead=%d, flood=%d, core=%d voxels\n', ...
+        nnz(lead), nnz(marker_mask), nnz(marker_core));
 
     % Artifact weight field: Gaussian decay from marker boundary
     d_vox = bwdist(marker_mask);
