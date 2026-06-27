@@ -361,6 +361,12 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
             continue;
         end
 
+        % Reject air pockets (mean HU < 50) before wasting FMM slots
+        if comp_mean_hus(idx) < 50
+            fprintf('      Skipping component %d: mean HU %.0f (air pocket)\n', idx, comp_mean_hus(idx));
+            continue;
+        end
+
         % Seed = deepest interior point of this component
         comp_mask = false(sz);
         comp_mask(CC.PixelIdxList{idx}) = true;
@@ -425,7 +431,11 @@ function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
     Gsrc = 1 - mat2gray(gradientweight(vol));
 
     ths = linspace(0.14, 0.42, 9);
-    HU_MIN = max(180, min(400, softMed + 220));
+    % For excised-in-air: softMed ~280-370 reflects bone tissue, not soft
+    % tissue. Using softMed+220 gives HU_MIN=400-500 which penalizes
+    % cancellous bone (100-300 HU), creating hollow interiors. Use a low
+    % threshold that only rejects air, not real bone tissue.
+    HU_MIN = max(50, min(200, softMed * 0.4));
     lambda = 0.5;
 
     best_score = -Inf;
@@ -524,23 +534,20 @@ end
 %  (~700-1200 HU near lead), and light flags/housing (200-700 HU near lead).
 % =========================================================================
 function [marker_mask, artifact_w, marker_core] = marker_and_artifact_maps(HU, sigma_mm, spacing)
-    % Lead letter cores: HU > 1200 (typically 4000-7000 HU)
-    lead = HU > 1200;
+    % Lead letter cores: HU > 3000 (actual lead is 4000-7000 HU, 3000 catches
+    % partial-volume edges; 1200 was wrong — dense cortical bone is 1200-2000)
+    lead = HU > 3000;
 
-    % Dense flags/tabs: 700-1200 HU within 3 voxels of lead
-    % Keep radius small — cortical bone is also 700-1200 HU and sits
-    % right next to markers, so larger radii grab real bone surface.
-    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 3));
+    % Dense flags/tabs: 1000-3000 HU within 3 voxels of actual lead
+    dense_flags = (HU >= 1000 & HU <= 3000) & imdilate(lead, strel('sphere', 3));
 
-    % Light flags/housing: 200-700 HU within 2 voxels of lead+dense only
-    % Keep radius small — this HU range overlaps real bone tissue
+    % Light flags/housing: 200-1000 HU within 2 voxels of lead+dense
     lead_plus_dense = lead | dense_flags;
-    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 2));
+    light_flags = (HU >= 200 & HU <= 1000) & imdilate(lead_plus_dense, strel('sphere', 2));
 
     marker_mask = lead | dense_flags | light_flags;
 
-    % Core marker mask (lead + dense only) — used for hard-block carving
-    % that won't accidentally remove bone tissue
+    % Core = lead + dense flags only (safe to hard-carve)
     marker_core = lead | dense_flags;
 
     fprintf('    Marker layers: lead=%d, dense_flags=%d, light_flags=%d, total=%d voxels\n', ...
@@ -668,7 +675,9 @@ function BW = seal_outer_shell(BW, spacing)
     BW = imfill(BW, 'holes');
 
     BW = keep_largest_3d(BW);
-    BW = imclearborder(BW, 26);
+    % No imclearborder — for excised-in-air specimens the bone itself
+    % often spans the full height of the local ROI, so clearing border
+    % voxels destroys the entire mask.
 end
 
 
