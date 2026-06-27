@@ -28,21 +28,22 @@ try
      end
      infosCell = normMeta(meta);
  end
-catch
- % ignore and fall through
+catch ME1
+ fprintf('[Load] dicomCollection failed: %s\n', ME1.message);
 end
 % 2) Direct bulk read on the folder (works great for Slicer exports)
 if isempty(Vraw)
  try
      [Vraw,~,meta] = dicomreadVolume(folder);
      infosCell = normMeta(meta);
- catch
-     % fall through
+ catch ME2
+     fprintf('[Load] dicomreadVolume(folder) failed: %s\n', ME2.message);
  end
 end
 % 3) Legacy fallback: enumerate files manually (rarely needed here)
 if isempty(Vraw)
  files = listDicomFiles(folder);
+ fprintf('[Load] Legacy fallback: found %d candidate files\n', numel(files));
  if isempty(files), error('No readable DICOM files found under: %s', folder); end
  [Vraw, infosCell] = tryDicomReadVolume(files, folder);
  if isempty(Vraw)
