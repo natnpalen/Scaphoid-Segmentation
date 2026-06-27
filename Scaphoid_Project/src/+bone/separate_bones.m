@@ -4,28 +4,28 @@ function result = separate_bones(ds, opts)
 %   result = bone.separate_bones(ds, opts)
 %
 % Uses the scaphoid pipeline's seed-and-grow approach adapted for multiple
-% bones.  Instead of subtracting tags, each bone is GROWN from a seed point
-% using FMM with artifact-weighted speeds.  Tags are never included because
-% growth is suppressed near marker assemblies.
+% bones.  Each bone is GROWN from a seed point using FMM with artifact-
+% weighted speeds, constrained to a local region around its source component.
 %
 % Algorithm:
-%   1. Detect markers and build artifact weight field (Gaussian falloff)
+%   1. Detect markers (lead + dense flags + light flags) and build artifact field
 %   2. Find seed points: one per bone (deepest interior of compact components)
-%   3. Per-seed FMM growth with adaptive threshold scoring
+%   3. Per-seed LOCAL FMM growth with adaptive threshold scoring
 %   4. Post-processing: marker carve with protected interior, boundary refine
 
 vol = double(ds.HU);
 spacing = ds.spacing;
 voxel_vol = prod(spacing);
+sz = size(vol);
 
 % ---- Stage 1: Markers and artifact field ----
 fprintf('  [Separate] Stage 1: Marker detection & artifact field...\n');
-[marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.MarkerRangeHU, ...
-    opts.ArtifactSigmaMM, spacing);
+[marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.ArtifactSigmaMM, spacing);
 metal = vol > opts.TagHUMin;
 
 fprintf('    Marker mask: %d voxels (%.0f mm^3)\n', sum(marker_mask(:)), sum(marker_mask(:))*voxel_vol);
 fprintf('    Metal (HU>%d): %d voxels (%.0f mm^3)\n', opts.TagHUMin, sum(metal(:)), sum(metal(:))*voxel_vol);
+fprintf('    Artifact sigma: %.1f mm\n', opts.ArtifactSigmaMM);
 
 % Identify individual marker assemblies
 CC_metal = bwconncomp(metal, 26);
@@ -33,11 +33,12 @@ min_tag_vox = max(5, round(2.0 / voxel_vol));
 real_tags = {};
 for i = 1:CC_metal.NumObjects
     if numel(CC_metal.PixelIdxList{i}) >= min_tag_vox
-        [rr, cc, ss] = ind2sub(size(vol), CC_metal.PixelIdxList{i});
+        [rr, cc, ss] = ind2sub(sz, CC_metal.PixelIdxList{i});
         tag = struct();
         tag.label = numel(real_tags) + 1;
         tag.centroid_mm = [mean(rr) mean(cc) mean(ss)] .* spacing;
         tag.volume_mm3 = numel(CC_metal.PixelIdxList{i}) * voxel_vol;
+        tag.voxel_idx = CC_metal.PixelIdxList{i};
         real_tags{end+1} = tag; %#ok<AGROW>
     end
 end
@@ -52,13 +53,14 @@ fprintf('  [Separate] Stage 2: Finding bone seed points...\n');
 seeds = find_bone_seeds(vol, marker_mask, spacing, opts.MinBoneVolMM3);
 fprintf('    Found %d seed points\n', numel(seeds));
 for si = 1:numel(seeds)
-    fprintf('      Seed %d: [%d %d %d] vox, component %.0f mm^3, score %.2f\n', ...
-        si, seeds{si}.ijk, seeds{si}.comp_vol_mm3, seeds{si}.score);
+    seed_hu = vol(seeds{si}.ijk(1), seeds{si}.ijk(2), seeds{si}.ijk(3));
+    fprintf('      Seed %d: [%d %d %d] vox, HU=%.0f, component %.0f mm^3 (mean HU %.0f), score %.2f\n', ...
+        si, seeds{si}.ijk, seed_hu, seeds{si}.comp_vol_mm3, seeds{si}.comp_mean_hu, seeds{si}.score);
 end
 
 if isempty(seeds)
     warning('No bone seeds found.');
-    result = struct('bones', {{}}, 'specimen', false(size(vol)), ...
+    result = struct('bones', {{}}, 'specimen', false(sz), ...
         'marker_mask', marker_mask, 'artifact_weight', artifact_w, 'n_tags', numel(real_tags));
     return;
 end
@@ -66,72 +68,134 @@ end
 % ---- Stage 3: Grow each bone from its seed using FMM ----
 fprintf('  [Separate] Stage 3: Growing bones from seeds (FMM)...\n');
 
-% Compute gradient once (shared across all seeds)
-G = imgradient3(vol);
-
-% Soft-tissue median and non-marker HU stats (same as scaphoid pipeline)
+% Global stats (used for thresholds)
 softMed = median(vol(vol > -300), 'omitnan');
 if ~isfinite(softMed), softMed = -300; end
-vals = vol(~marker_mask & vol > -300 & vol < 2000);
-if isempty(vals), vals = vol(isfinite(vol)); end
-
-% Core threshold (94th percentile of non-marker HU, clamped to [280, 700])
-core_thr = max(280, min(700, prctile(vals, 94)));
-core = vol > core_thr;
-
-% Specimen mask (largest non-air component)
-specimen = build_specimen_mask(vol, spacing);
+fprintf('    Global softMed: %.0f HU\n', softMed);
 
 bones = {};
-all_bone_masks = false(size(vol));
+all_bone_masks = false(sz);
 
 for si = 1:numel(seeds)
     seed_ijk = seeds{si}.ijk;
+    comp_mask = seeds{si}.comp_mask;
     fprintf('    Bone %d: seed [%d %d %d]...\n', si, seed_ijk);
 
-    seedMask = false(size(vol));
-    seedMask(seed_ijk(1), seed_ijk(2), seed_ijk(3)) = true;
+    % === LOCAL CROP around source component + margin ===
+    % This is analogous to the scaphoid's buildSpecimenCrop — constrains
+    % FMM to the local bone region, preventing cross-bone growth.
+    margin_mm = 10.0;
+    margin_vox = ceil(margin_mm ./ spacing);
+    [ri, ci, si_idx] = ind2sub(sz, find(comp_mask));
+    r1 = max(1, min(ri) - margin_vox(1));  r2 = min(sz(1), max(ri) + margin_vox(1));
+    c1 = max(1, min(ci) - margin_vox(2));  c2 = min(sz(2), max(ci) + margin_vox(2));
+    s1 = max(1, min(si_idx) - margin_vox(3)); s2 = min(sz(3), max(si_idx) + margin_vox(3));
+    fprintf('      Local ROI: [%d:%d, %d:%d, %d:%d] = %dx%dx%d\n', ...
+        r1, r2, c1, c2, s1, s2, r2-r1+1, c2-c1+1, s2-s1+1);
 
-    % Build FMM weight map (scaphoid pipeline approach)
-    W = build_fmm_weights(vol, seedMask, artifact_w, opts);
+    % Extract local volumes
+    vol_L = vol(r1:r2, c1:c2, s1:s2);
+    art_L = artifact_w(r1:r2, c1:c2, s1:s2);
+    mk_L  = marker_mask(r1:r2, c1:c2, s1:s2);
+    all_L = all_bone_masks(r1:r2, c1:c2, s1:s2);
 
-    % Apply gradient and HU-based allow region
-    HU_ALLOW_MIN = max(70, min(220, softMed + 110));
-    gThr = prctile(G(:), 85);
-    maskR = (vol > HU_ALLOW_MIN) | (G > gThr);
+    % Local seed mask
+    seed_local = [seed_ijk(1)-r1+1, seed_ijk(2)-c1+1, seed_ijk(3)-s1+1];
+    seedMask_L = false(size(vol_L));
+    seedMask_L(seed_local(1), seed_local(2), seed_local(3)) = true;
 
-    % Reconstruct from core through allowed region within specimen
-    if any(core(:))
-        allow = imreconstruct(core, maskR) & specimen;
+    % Learn seed stats from the SOURCE COMPONENT (not just one voxel)
+    comp_L = comp_mask(r1:r2, c1:c2, s1:s2);
+    comp_vals = vol_L(comp_L & vol_L > -200);
+    if numel(comp_vals) >= 10
+        mu1 = median(comp_vals);
+        s1_stat = mad(comp_vals, 1) + 50;
     else
-        allow = maskR & specimen;
+        mu1 = vol_L(seed_local(1), seed_local(2), seed_local(3));
+        s1_stat = 50;
+    end
+    fprintf('      Seed stats: mu1=%.0f, s1=%.0f (from %d component voxels)\n', ...
+        mu1, s1_stat, numel(comp_vals));
+
+    % Build FMM weight map (scaphoid buildWeights approach)
+    W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
+
+    % Local gradient
+    G_L = imgradient3(vol_L);
+
+    % Non-marker HU stats for thresholds
+    vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
+    if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
+
+    % Allow region (same logic as scaphoid)
+    HU_ALLOW_MIN = max(70, min(220, softMed + 110));
+    gThr = prctile(G_L(:), 85);
+    maskR = (vol_L > HU_ALLOW_MIN) | (G_L > gThr);
+
+    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
+    core_L = vol_L > core_thr_L;
+
+    % Non-air local specimen
+    specimen_L = vol_L > -500;
+    specimen_L = imclose(specimen_L, strel('sphere', 1));
+
+    if any(core_L(:))
+        allow_L = imreconstruct(core_L, maskR) & specimen_L;
+    else
+        allow_L = maskR & specimen_L;
     end
 
-    % Zero weight outside allowed region
-    W(~allow) = eps;
+    % Exclude already-assigned bone voxels
+    allow_L = allow_L & ~all_L;
 
-    % Robust normalize
-    Lo = prctile(W(:), 1); Hi = prctile(W(:), 99);
-    W = min(max((W - Lo) / max(eps, (Hi - Lo)), 0), 1);
-    W = max(W, eps);
+    % Zero weight outside allowed region
+    W_L(~allow_L) = eps;
+
+    % Robust normalize (same as scaphoid)
+    Lo = prctile(W_L(:), 1); Hi = prctile(W_L(:), 99);
+    W_L = min(max((W_L - Lo) / max(eps, (Hi - Lo)), 0), 1);
+    W_L = max(W_L, eps);
+
+    fprintf('      W range: [%.4f, %.4f], allow: %d voxels\n', ...
+        min(W_L(:)), max(W_L(:)), nnz(allow_L));
 
     % Run FMM
-    th0 = min(max(0.01, mean(W(seedMask)) * 0.5), 0.99);
-    [~, D] = imsegfmm(W, seedMask, th0);
+    th0 = min(max(0.01, mean(W_L(seedMask_L)) * 0.5), 0.99);
+    fprintf('      FMM th0: %.4f\n', th0);
 
-    % Adaptive threshold sweep (9 thresholds from 0.14 to 0.42)
-    mask_bone = adaptive_fmm_threshold(D, vol, G, softMed, specimen);
+    try
+        [~, D_L] = imsegfmm(W_L, seedMask_L, th0);
+    catch ME
+        fprintf('      FMM failed: %s — skipping\n', ME.message);
+        continue;
+    end
+
+    fprintf('      FMM D range: [%.4f, %.4f]\n', min(D_L(:)), max(D_L(:)));
+
+    % Adaptive threshold sweep (scaphoid approach with correct score image)
+    mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L);
+
+    if ~any(mask_bone_L(:))
+        fprintf('      -> empty after threshold sweep, skipped\n');
+        continue;
+    end
+    fprintf('      After threshold: %d voxels (%.0f mm^3)\n', ...
+        nnz(mask_bone_L), nnz(mask_bone_L)*voxel_vol);
 
     % Don't overlap with already-assigned bone voxels
-    mask_bone = mask_bone & ~all_bone_masks;
+    mask_bone_L = mask_bone_L & ~all_L;
 
     % Post-processing (scaphoid approach)
-    mask_bone = postprocess_bone(mask_bone, marker_mask, vol, G, softMed, core, spacing);
+    mask_bone_L = postprocess_bone(mask_bone_L, mk_L, vol_L, G_L, softMed, core_L, spacing);
 
-    if ~any(mask_bone(:))
+    if ~any(mask_bone_L(:))
         fprintf('      -> empty after post-processing, skipped\n');
         continue;
     end
+
+    % Paste back to full volume
+    mask_bone = false(sz);
+    mask_bone(r1:r2, c1:c2, s1:s2) = mask_bone_L;
 
     bone_vol = sum(mask_bone(:)) * voxel_vol;
     if bone_vol < opts.MinBoneVolMM3
@@ -150,7 +214,7 @@ for si = 1:numel(seeds)
     end
 
     % Centroid
-    [rr, cc, ss] = ind2sub(size(mask_bone), find(mask_bone));
+    [rr, cc, ss] = ind2sub(sz, find(mask_bone));
     centroid_mm = [mean(rr), mean(cc), mean(ss)] .* spacing;
     bbox = [min(rr) min(cc) min(ss) max(rr) max(cc) max(ss)];
 
@@ -172,12 +236,14 @@ end
 
 % ---- Stage 4: Tag association ----
 fprintf('  [Separate] Stage 4: Tag association...\n');
-bones = associate_tags(bones, real_tags);
+bones = associate_tags(bones, real_tags, spacing);
 
 % Sort by volume (largest first)
-vols = cellfun(@(b) b.volume_mm3, bones);
-[~, order] = sort(vols, 'descend');
-bones = bones(order);
+if ~isempty(bones)
+    vols = cellfun(@(b) b.volume_mm3, bones);
+    [~, order] = sort(vols, 'descend');
+    bones = bones(order);
+end
 
 fprintf('\n  Found %d bones and %d markers\n', numel(bones), numel(real_tags));
 for i = 1:numel(bones)
@@ -190,6 +256,9 @@ for i = 1:numel(bones)
     fprintf('    Bone %d: %.1f mm^3, mean HU %.0f, %s\n', ...
         i, b.volume_mm3, b.mean_hu, tag_str);
 end
+
+% Specimen mask for output
+specimen = build_specimen_mask(vol, spacing);
 
 result = struct();
 result.bones = bones;
@@ -208,6 +277,7 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     sz = size(vol);
 
     % Non-air, excluding markers + 2-voxel buffer + border voxels
+    % (identical to scaphoid proposeScaphoidSeed)
     bw = vol > -300;
     bw = bw & ~imdilate(marker_mask, strel('sphere', 2));
 
@@ -220,21 +290,30 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     bw = bwareaopen(bw, max(200, round(min_vol_mm3 / voxel_vol)));
 
     CC = bwconncomp(bw, 26);
+    fprintf('    Initial components (after marker exclusion): %d\n', CC.NumObjects);
     if CC.NumObjects == 0
         seeds = {};
         return;
     end
 
-    % Score each component by sphericity, elongation, and volume
-    % (same scoring as scaphoid pipeline)
+    % Score each component (same as scaphoid pipeline)
     scores = zeros(CC.NumObjects, 1);
     comp_vols = zeros(CC.NumObjects, 1);
+    comp_mean_hus = zeros(CC.NumObjects, 1);
 
     for n = 1:CC.NumObjects
         M = false(sz);
         M(CC.PixelIdxList{n}) = true;
         V_vox = numel(CC.PixelIdxList{n});
         comp_vols(n) = V_vox * voxel_vol;
+
+        hvals = vol(CC.PixelIdxList{n});
+        hvals_tissue = hvals(hvals > -200);
+        if ~isempty(hvals_tissue)
+            comp_mean_hus(n) = mean(hvals_tissue);
+        else
+            comp_mean_hus(n) = mean(hvals);
+        end
 
         try
             stats = regionprops3(M, 'Volume', 'SurfaceArea', 'PrincipalAxisLength');
@@ -248,9 +327,11 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         catch
             scores(n) = log1p(V_vox);
         end
+
+        fprintf('      Component %d: %.0f mm^3, mean HU %.0f, score %.2f\n', ...
+            n, comp_vols(n), comp_mean_hus(n), scores(n));
     end
 
-    % Keep components that could be bones (volume > threshold)
     % Sort by score descending
     [~, order] = sort(scores, 'descend');
 
@@ -265,7 +346,7 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         comp_mask = false(sz);
         comp_mask(CC.PixelIdxList{idx}) = true;
         Dm = bwdist(~comp_mask);
-        [~, max_idx] = max(Dm(:));
+        [max_depth, max_idx] = max(Dm(:));
         [si, sj, sk] = ind2sub(sz, max_idx);
 
         % Clamp away from borders
@@ -277,26 +358,33 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         seed.ijk = [si, sj, sk];
         seed.score = scores(idx);
         seed.comp_vol_mm3 = comp_vols(idx);
+        seed.comp_mean_hu = comp_mean_hus(idx);
+        seed.comp_mask = comp_mask;
+        seed.max_depth_vox = max_depth;
         seeds{end+1} = seed; %#ok<AGROW>
     end
 end
 
 
 % =========================================================================
-%  FMM WEIGHT MAP (same as scaphoid buildWeights)
+%  FMM WEIGHT MAP (scaphoid buildWeights, using component-learned stats)
 % =========================================================================
-function W = build_fmm_weights(vol, seedMask, artifact_w, opts)
-    fgVals = vol(seedMask);
-    mu1 = median(fgVals);
-    s1 = mad(fgVals, 1) + 50;
-
+function W = build_fmm_weights_local(vol, seedMask, artifact_w, mu1, s1)
+    % Background stats from shell around seed
     bg = imdilate(seedMask, strel('sphere', 6)) & ~imdilate(seedMask, strel('sphere', 2));
     bgVals = vol(bg);
-    mu0 = median(bgVals);
-    s0 = mad(bgVals, 1) + 50;
+    if isempty(bgVals)
+        mu0 = -300;
+        s0 = 100;
+    else
+        mu0 = median(bgVals);
+        s0 = mad(bgVals, 1) + 50;
+    end
 
     pBone = 1 ./ (1 + exp(-(vol - mu1) ./ s1));
     pTiss = 1 ./ (1 + exp(-(mu0 - vol) ./ s0));
+
+    % Use gradientweight (same as scaphoid buildWeights)
     edgeW = 1 - mat2gray(gradientweight(vol));
     dataW = mat2gray(pBone ./ (pTiss + eps));
 
@@ -308,19 +396,21 @@ end
 
 
 % =========================================================================
-%  ADAPTIVE FMM THRESHOLD (same as scaphoid segmentScaphoidFMM scoring)
+%  ADAPTIVE FMM THRESHOLD (scaphoid segmentScaphoidFMM scoring)
 % =========================================================================
 function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
-    Gsrc = mat2gray(imgradient3(vol));
-    ths = linspace(0.14, 0.42, 9);
+    % Use same boundary score image as scaphoid: 1 - gradientweight
+    Gsrc = 1 - mat2gray(gradientweight(vol));
 
+    ths = linspace(0.14, 0.42, 9);
     HU_MIN = max(180, min(400, softMed + 220));
+    lambda = 0.5;
 
     best_score = -Inf;
     best_mask = false(size(vol));
 
-    for t = ths
-        t = min(max(t, eps), 0.999);
+    for ti = 1:numel(ths)
+        t = min(max(ths(ti), eps), 0.999);
         B = D <= t;
         B = B & specimen;
         B = keep_largest_3d(B);
@@ -338,7 +428,11 @@ function mask = adaptive_fmm_threshold(D, vol, G, softMed, specimen)
         penHU = max(0, HU_MIN - medHU) / HU_MIN;
         penVol = 1e-7 * double(nnz(B));
 
-        s = s_edge - 0.5 * penHU - penVol;
+        s = s_edge - lambda * penHU - penVol;
+
+        fprintf('        th=%.3f: %d vox, edge=%.3f, medHU=%.0f, penHU=%.3f, score=%.4f%s\n', ...
+            t, nnz(B), s_edge, medHU, penHU, s, ternary(s > best_score, ' *', ''));
+
         if s > best_score
             best_score = s;
             best_mask = B;
@@ -440,14 +534,28 @@ end
 
 
 % =========================================================================
-%  MARKER AND ARTIFACT MAPS (same as scaphoid markerAndArtifactMaps)
+%  MARKER AND ARTIFACT MAPS
+%  Detects the full marker assembly: lead letter (HU>1200), dense flags
+%  (~700-1200 HU near lead), and light flags/housing (200-700 HU near lead).
 % =========================================================================
-function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, marker_range, sigma_mm, spacing)
+function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, sigma_mm, spacing)
+    % Lead letter cores: HU > 1200 (typically 4000-7000 HU)
     lead = HU > 1200;
-    flags = (HU >= marker_range(1) & HU <= marker_range(2)) & ...
-            imdilate(lead, strel('sphere', 2));
-    marker_mask = lead | flags;
 
+    % Dense flags/tabs: 700-1200 HU within 3 voxels of lead
+    % (the user reported flag tabs at ~1000 HU — missed by old [200,700] range)
+    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 3));
+
+    % Light flags/housing: 200-700 HU within 2 voxels of lead or dense flags
+    lead_plus_dense = lead | dense_flags;
+    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 2));
+
+    marker_mask = lead | dense_flags | light_flags;
+
+    fprintf('    Marker layers: lead=%d, dense_flags=%d, light_flags=%d, total=%d voxels\n', ...
+        nnz(lead), nnz(dense_flags), nnz(light_flags), nnz(marker_mask));
+
+    % Artifact weight field: Gaussian decay from marker boundary
     d_vox = bwdist(marker_mask);
     d_mm = d_vox * mean(spacing);
     artifact_w = exp(-(d_mm / sigma_mm).^2);
@@ -455,30 +563,44 @@ end
 
 
 % =========================================================================
-%  TAG ASSOCIATION
+%  TAG ASSOCIATION (mask overlap, not centroid distance)
 % =========================================================================
-function bones = associate_tags(bones, tags)
+function bones = associate_tags(bones, tags, spacing)
     if isempty(tags) || isempty(bones), return; end
-    centroids = zeros(numel(bones), 3);
-    for i = 1:numel(bones)
-        centroids(i,:) = bones{i}.centroid_mm;
-    end
 
-    fprintf('    Tag-bone distances (mm):\n');
+    fprintf('    Tag-bone associations:\n');
+    vox_mm = mean(spacing);
+
     for t = 1:numel(tags)
-        dists = vecnorm(centroids - tags{t}.centroid_mm, 2, 2);
-        [d, idx] = min(dists);
-        fprintf('      Marker %d -> Bone %d: %.1f mm\n', t, idx, d);
-        if isempty(bones{idx}.tag_id) || d < bones{idx}.tag_dist
-            bones{idx}.tag_id = tags{t}.label;
-            bones{idx}.tag_dist = d;
+        best_dist = Inf;
+        best_bone = 0;
+
+        for bi = 1:numel(bones)
+            % Surface-to-surface distance (more robust than centroid for irregular shapes)
+            D_from_bone = bwdist(bones{bi}.mask);
+            tag_dists = D_from_bone(tags{t}.voxel_idx);
+            min_dist_mm = min(tag_dists) * vox_mm;
+
+            if min_dist_mm < best_dist
+                best_dist = min_dist_mm;
+                best_bone = bi;
+            end
+        end
+
+        if best_bone > 0
+            fprintf('      Marker %d -> Bone %d: %.1f mm (surface-to-surface)\n', ...
+                t, best_bone, best_dist);
+            if isempty(bones{best_bone}.tag_id) || best_dist < bones{best_bone}.tag_dist
+                bones{best_bone}.tag_id = tags{t}.label;
+                bones{best_bone}.tag_dist = best_dist;
+            end
         end
     end
 end
 
 
 % =========================================================================
-%  UTILITY
+%  UTILITIES
 % =========================================================================
 function mask = keep_largest_3d(mask)
     CC = bwconncomp(mask, 26);
@@ -486,4 +608,8 @@ function mask = keep_largest_3d(mask)
     [~, iMax] = max(cellfun(@numel, CC.PixelIdxList));
     mask = false(size(mask));
     mask(CC.PixelIdxList{iMax}) = true;
+end
+
+function s = ternary(cond, a, b)
+    if cond, s = a; else, s = b; end
 end
