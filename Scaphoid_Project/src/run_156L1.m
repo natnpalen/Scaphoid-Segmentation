@@ -4,7 +4,7 @@
 %
 % Paths are set to the 156L-1 scan and mechanical specimen STL files.
 % Edit below if your files are in a different location.
-clear all; close all;
+clear all; close all; clc;
 dicomFolder = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\New Bone Scans\156L-1\DICOMOBJ';
 stlFolder   = 'C:\Users\natha\OneDrive\Documents\Nathaniel\For Nick\Mechancial Specimens';
 
