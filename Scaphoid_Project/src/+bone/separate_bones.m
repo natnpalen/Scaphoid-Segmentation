@@ -123,20 +123,30 @@ for si = 1:numel(seeds)
         mu1, s1_stat, numel(comp_vals));
 
     % === Scaphoid-style allow region: core -> allow -> imreconstruct ===
-    % This is THE critical step the scaphoid pipeline uses to prevent FMM
-    % from leaking into markers and non-bone material. Build a connected
-    % bone-shaped allow region, then block everything outside it.
     G_L = imgradient3(vol_L);
+
+    % Distance from lead in local ROI (mm) — used to suppress flag tabs
+    d_lead_L = bwdist(lead_L) * mean(spacing);
 
     vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
     if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
     core_thr_L = max(280, min(700, prctile(vals_L, 94)));
     core_L = vol_L > core_thr_L;
 
+    % Exclude near-lead voxels from core: flag tabs (700-1200 HU) sit
+    % within ~3-5mm of lead and would otherwise seed the allow region,
+    % connecting flags to bone through imreconstruct.
+    LEAD_BUFFER_MM = 5.0;
+    near_lead_L = d_lead_L < LEAD_BUFFER_MM;
+    core_L = core_L & ~near_lead_L;
+
     % Allow = moderate HU OR high gradient (catches cancellous bone)
     HU_ALLOW_MIN = max(70, min(220, softMed + 110));
     gThr_L = prctile(G_L(:), 85);
     maskR_L = (vol_L > HU_ALLOW_MIN) | (G_L > gThr_L);
+
+    % Also exclude near-lead from the reachable mask
+    maskR_L = maskR_L & ~near_lead_L;
 
     % Flood-fill from core through allow — gives connected bone region
     if any(core_L(:))
@@ -146,7 +156,8 @@ for si = 1:numel(seeds)
     end
     % Exclude markers and already-assigned bones from allow
     allow_L = allow_L & ~mk_L & ~lead_L & ~all_L;
-    fprintf('      Allow region: core=%d, allow=%d voxels\n', nnz(core_L), nnz(allow_L));
+    fprintf('      Allow region: core=%d, allow=%d, lead_buffer=%d voxels\n', ...
+        nnz(core_L), nnz(allow_L), nnz(near_lead_L));
 
     % Build FMM weight map
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
@@ -200,8 +211,11 @@ for si = 1:numel(seeds)
         continue;
     end
 
-    % Remove marker material AFTER sealing (imclose can re-bridge)
-    mask_bone_L = mask_bone_L & ~mk_L & ~lead_L;
+    % Remove marker material AFTER sealing (imclose can re-bridge).
+    % Also carve flag-like material near lead: voxels within 4mm of lead
+    % with HU > 600 are almost certainly flag tabs, not bone.
+    flag_carve_L = (d_lead_L < 4.0) & (vol_L > 600);
+    mask_bone_L = mask_bone_L & ~mk_L & ~lead_L & ~flag_carve_L;
     mask_bone_L = imfill(mask_bone_L, 'holes');
     mask_bone_L = keep_largest_3d(mask_bone_L);
 
