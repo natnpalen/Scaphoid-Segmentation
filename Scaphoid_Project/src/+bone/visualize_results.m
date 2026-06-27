@@ -107,8 +107,9 @@ if ~isempty(seg_results)
 
         axis equal vis3d off;
         camlight headlight; lighting gouraud;
-        title(sprintf('Bone %d\nCort %.0f%% | Canc %.0f%%', bi, ...
+        title(sprintf('Bone %d\nCort %.0f%% (red) | Canc %.0f%% (blue)', bi, ...
             seg.info.cortical_fraction*100, (1-seg.info.cortical_fraction)*100));
+        legend('Location', 'southoutside');
     end
 end
 
