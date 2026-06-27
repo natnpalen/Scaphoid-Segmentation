@@ -18,12 +18,11 @@ try
      else
          dc2 = dc;
      end
-     % Pick first series (good enough when there's only one)
+     % Pick first series — pass the table row directly (version-safe)
      idx = 1;
-     if any(strcmp(dc2.Properties.VariableNames,'SeriesInstanceUID'))
-         uid = dc2.SeriesInstanceUID(idx);
-         [Vraw,~,meta] = dicomreadVolume(dc, 'SeriesInstanceUID', uid);
-     else
+     try
+         [Vraw,~,meta] = dicomreadVolume(dc2(idx,:));
+     catch
          [Vraw,~,meta] = dicomreadVolume(folder);
      end
      infosCell = normMeta(meta);
@@ -111,14 +110,11 @@ keep = false(size(paths));
 for i=1:numel(paths)
  p = paths{i};
  try
-     if dir(p).bytes < 512, keep(i)=false; continue; end
-     info = dicominfo(p);
-     it = getField(info,'ImageType','');
-     toks = string(ischar(it) * split(it,'\') + ~ischar(it) * it); %#ok<NASGU>
-     % Skip obvious localizers if flagged (leave as-is; many sets don't)
+     d = dir(p);
+     if d.bytes < 512, continue; end
+     dicominfo(p);
      keep(i) = true;
  catch
-     keep(i)=false;
  end
 end
 filesList = paths(keep);
