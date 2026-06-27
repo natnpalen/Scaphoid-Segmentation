@@ -20,14 +20,19 @@ fprintf('    Specimen: %.0f mm^3 (%d voxels)\n', ...
 
 % ---- Stage 2: Marker & artifact detection (scaphoid pipeline approach) ----
 fprintf('  [Separate] Stage 2: Marker & artifact detection...\n');
+lead_core = vol > opts.TagHUMin;
 [marker_mask, artifact_w] = marker_and_artifact_maps(vol, opts.MarkerRangeHU, ...
     opts.ArtifactSigmaMM, spacing);
 
-% Dilate marker mask for exclusion (scaphoid pipeline uses sphere(2))
-marker_excl = imdilate(marker_mask, strel('sphere', 3));
+% Extended marker mask: also include bright voxels (700-1200 HU) near lead
+% that aren't caught by the standard collar range
+bright_near_lead = (vol >= 700 & vol <= 1200) & imdilate(lead_core, strel('sphere', 4));
+marker_mask_ext = marker_mask | bright_near_lead;
+
+% Dilate for exclusion — generous to prevent tag-bone merging
+marker_excl = imdilate(marker_mask_ext, strel('sphere', 5));
 
 % Count actual lead tags (real tags are big enough, not streak artifacts)
-lead_core = vol > opts.TagHUMin;
 CC_tags = bwconncomp(lead_core, 26);
 min_tag_vox = max(5, round(2.0 / voxel_vol));  % at least 2 mm^3
 real_tags = {};
@@ -76,6 +81,23 @@ for i = 1:CC.NumObjects
     if dense_frac < 0.02
         fprintf('    Component %d: %.0f mm^3 — skipped (%.1f%% dense)\n', ...
             i, comp_vol, dense_frac*100);
+        continue;
+    end
+
+    % Mean HU must be plausible for bone (not air/noise)
+    mean_hu_raw = mean(vol(comp));
+    if mean_hu_raw < -100
+        fprintf('    Component %d: %.0f mm^3 — skipped (mean HU %.0f, not bone)\n', ...
+            i, comp_vol, mean_hu_raw);
+        continue;
+    end
+
+    % Reject if significant fraction is very bright (likely tag material)
+    n_very_bright = sum(vol(comp) > 1000);
+    bright_frac = n_very_bright / max(1, sum(comp(:)));
+    if bright_frac > 0.10
+        fprintf('    Component %d: %.0f mm^3 — skipped (%.0f%% > 1000 HU, likely tag)\n', ...
+            i, comp_vol, bright_frac*100);
         continue;
     end
 
