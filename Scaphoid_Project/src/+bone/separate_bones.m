@@ -11,12 +11,16 @@ function result = separate_bones(ds, opts)
 %   1. Detect markers (lead + dense flags + light flags) and build artifact field
 %   2. Find seed points: one per bone (deepest interior of compact components)
 %   3. Per-seed LOCAL FMM growth with adaptive threshold scoring
-%   4. Post-processing: marker carve with protected interior, boundary refine
+%   4. Post-processing: marker carve, shell sealing, boundary refine
+%   5. Reject non-bone objects (negative mean HU)
 
 vol = double(ds.HU);
 spacing = ds.spacing;
 voxel_vol = prod(spacing);
 sz = size(vol);
+
+% Hard metal mask: voxels that must NEVER be included in any bone
+lead_metal = vol > 4000;
 
 % ---- Stage 1: Markers and artifact field ----
 fprintf('  [Separate] Stage 1: Marker detection & artifact field...\n');
@@ -25,6 +29,7 @@ metal = vol > opts.TagHUMin;
 
 fprintf('    Marker mask: %d voxels (%.0f mm^3)\n', sum(marker_mask(:)), sum(marker_mask(:))*voxel_vol);
 fprintf('    Metal (HU>%d): %d voxels (%.0f mm^3)\n', opts.TagHUMin, sum(metal(:)), sum(metal(:))*voxel_vol);
+fprintf('    Lead metal (HU>4000): %d voxels\n', nnz(lead_metal));
 fprintf('    Artifact sigma: %.1f mm\n', opts.ArtifactSigmaMM);
 
 % Identify individual marker assemblies
@@ -82,8 +87,6 @@ for si = 1:numel(seeds)
     fprintf('    Bone %d: seed [%d %d %d]...\n', si, seed_ijk);
 
     % === LOCAL CROP around source component + margin ===
-    % This is analogous to the scaphoid's buildSpecimenCrop — constrains
-    % FMM to the local bone region, preventing cross-bone growth.
     margin_mm = 10.0;
     margin_vox = ceil(margin_mm ./ spacing);
     [ri, ci, si_idx] = ind2sub(sz, find(comp_mask));
@@ -98,6 +101,7 @@ for si = 1:numel(seeds)
     art_L = artifact_w(r1:r2, c1:c2, s1:s2);
     mk_L  = marker_mask(r1:r2, c1:c2, s1:s2);
     all_L = all_bone_masks(r1:r2, c1:c2, s1:s2);
+    lead_L = lead_metal(r1:r2, c1:c2, s1:s2);
 
     % Local seed mask
     seed_local = [seed_ijk(1)-r1+1, seed_ijk(2)-c1+1, seed_ijk(3)-s1+1];
@@ -117,49 +121,16 @@ for si = 1:numel(seeds)
     fprintf('      Seed stats: mu1=%.0f, s1=%.0f (from %d component voxels)\n', ...
         mu1, s1_stat, numel(comp_vals));
 
-    % Build FMM weight map (scaphoid buildWeights approach)
+    % Build FMM weight map (scaphoid buildWeights approach — NO normalization)
     W_L = build_fmm_weights_local(vol_L, seedMask_L, art_L, mu1, s1_stat);
 
-    % Local gradient
-    G_L = imgradient3(vol_L);
+    % Hard-block lead metal and already-assigned bones in the weight map
+    W_L(lead_L) = eps;
+    W_L(all_L) = eps;
 
-    % Non-marker HU stats for thresholds
-    vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
-    if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
+    fprintf('      W range: [%.4f, %.4f]\n', min(W_L(:)), max(W_L(:)));
 
-    % Allow region (same logic as scaphoid)
-    HU_ALLOW_MIN = max(70, min(220, softMed + 110));
-    gThr = prctile(G_L(:), 85);
-    maskR = (vol_L > HU_ALLOW_MIN) | (G_L > gThr);
-
-    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
-    core_L = vol_L > core_thr_L;
-
-    % Non-air local specimen
-    specimen_L = vol_L > -500;
-    specimen_L = imclose(specimen_L, strel('sphere', 1));
-
-    if any(core_L(:))
-        allow_L = imreconstruct(core_L, maskR) & specimen_L;
-    else
-        allow_L = maskR & specimen_L;
-    end
-
-    % Exclude already-assigned bone voxels
-    allow_L = allow_L & ~all_L;
-
-    % Zero weight outside allowed region
-    W_L(~allow_L) = eps;
-
-    % Robust normalize (same as scaphoid)
-    Lo = prctile(W_L(:), 1); Hi = prctile(W_L(:), 99);
-    W_L = min(max((W_L - Lo) / max(eps, (Hi - Lo)), 0), 1);
-    W_L = max(W_L, eps);
-
-    fprintf('      W range: [%.4f, %.4f], allow: %d voxels\n', ...
-        min(W_L(:)), max(W_L(:)), nnz(allow_L));
-
-    % Run FMM
+    % Run FMM (pass weights directly, as scaphoid does — no normalization)
     th0 = min(max(0.01, mean(W_L(seedMask_L)) * 0.5), 0.99);
     fprintf('      FMM th0: %.4f\n', th0);
 
@@ -172,7 +143,12 @@ for si = 1:numel(seeds)
 
     fprintf('      FMM D range: [%.4f, %.4f]\n', min(D_L(:)), max(D_L(:)));
 
-    % Adaptive threshold sweep (scaphoid approach with correct score image)
+    % Non-air local specimen
+    specimen_L = vol_L > -500;
+    specimen_L = imclose(specimen_L, strel('sphere', 1));
+
+    % Adaptive threshold sweep (scaphoid approach)
+    G_L = imgradient3(vol_L);
     mask_bone_L = adaptive_fmm_threshold(D_L, vol_L, G_L, softMed, specimen_L);
 
     if ~any(mask_bone_L(:))
@@ -185,17 +161,30 @@ for si = 1:numel(seeds)
     % Don't overlap with already-assigned bone voxels
     mask_bone_L = mask_bone_L & ~all_L;
 
-    % Post-processing (scaphoid approach)
-    mask_bone_L = postprocess_bone(mask_bone_L, mk_L, vol_L, G_L, softMed, core_L, spacing);
+    % Hard-remove lead metal from bone mask
+    mask_bone_L = mask_bone_L & ~lead_L;
+
+    % Post-processing (marker carve + boundary refine)
+    vals_L = vol_L(~mk_L & vol_L > -300 & vol_L < 2000);
+    if isempty(vals_L), vals_L = vol_L(isfinite(vol_L)); end
+    core_thr_L = max(280, min(700, prctile(vals_L, 94)));
+    core_L = vol_L > core_thr_L;
+    mask_bone_L = postprocess_bone(mask_bone_L, mk_L, lead_L, vol_L, G_L, softMed, core_L, spacing);
 
     if ~any(mask_bone_L(:))
         fprintf('      -> empty after post-processing, skipped\n');
         continue;
     end
 
+    % Shell sealing (ensures closed surface — ported from scaphoid sealOuterShell)
+    mask_bone_L = seal_outer_shell(mask_bone_L, spacing);
+
     % Paste back to full volume
     mask_bone = false(sz);
     mask_bone(r1:r2, c1:c2, s1:s2) = mask_bone_L;
+
+    % Final hard-remove of all marker material from bone mask
+    mask_bone = mask_bone & ~marker_mask;
 
     bone_vol = sum(mask_bone(:)) * voxel_vol;
     if bone_vol < opts.MinBoneVolMM3
@@ -234,8 +223,24 @@ for si = 1:numel(seeds)
         bone_vol, bone_hu, bone_info.dense_fraction*100);
 end
 
-% ---- Stage 4: Tag association ----
-fprintf('  [Separate] Stage 4: Tag association...\n');
+% ---- Stage 4: Reject non-bone objects (negative mean HU) ----
+MIN_BONE_HU = 50;
+n_before = numel(bones);
+keep = true(1, numel(bones));
+for bi = 1:numel(bones)
+    if bones{bi}.mean_hu < MIN_BONE_HU
+        fprintf('    Rejecting bone %d: mean HU %.0f < %d (not bone tissue)\n', ...
+            bi, bones{bi}.mean_hu, MIN_BONE_HU);
+        keep(bi) = false;
+    end
+end
+bones = bones(keep);
+if numel(bones) < n_before
+    fprintf('    Rejected %d non-bone objects\n', n_before - numel(bones));
+end
+
+% ---- Stage 5: Tag association ----
+fprintf('  [Separate] Stage 5: Tag association...\n');
 bones = associate_tags(bones, real_tags, spacing);
 
 % Sort by volume (largest first)
@@ -277,7 +282,6 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
     sz = size(vol);
 
     % Non-air, excluding markers + 2-voxel buffer + border voxels
-    % (identical to scaphoid proposeScaphoidSeed)
     bw = vol > -300;
     bw = bw & ~imdilate(marker_mask, strel('sphere', 2));
 
@@ -296,7 +300,18 @@ function seeds = find_bone_seeds(vol, marker_mask, spacing, min_vol_mm3)
         return;
     end
 
-    % Score each component (same as scaphoid pipeline)
+    % Merge nearby fragments that were split by marker exclusion.
+    % Marker exclusion creates ~2-voxel gaps in bones that touch markers,
+    % splitting one bone into multiple fragments. Bridge these gaps by
+    % checking pairwise distances and merging components within 5mm.
+    MERGE_DIST_MM = 5.0;
+    merge_dist_vox = MERGE_DIST_MM / mean(spacing);
+    merged = merge_nearby_components(CC, sz, merge_dist_vox);
+    fprintf('    After merging nearby fragments: %d components\n', merged.NumObjects);
+
+    CC = merged;
+
+    % Score each component
     scores = zeros(CC.NumObjects, 1);
     comp_vols = zeros(CC.NumObjects, 1);
     comp_mean_hus = zeros(CC.NumObjects, 1);
@@ -446,15 +461,20 @@ end
 % =========================================================================
 %  POST-PROCESSING (scaphoid approach: marker carve + boundary refinement)
 % =========================================================================
-function mask = postprocess_bone(mask, marker_mask, vol, G, softMed, core, spacing)
+function mask = postprocess_bone(mask, marker_mask, lead_metal, vol, G, softMed, core, spacing)
     if ~any(mask(:)), return; end
+
+    % Hard-remove lead metal (HU>4000) — never allowed in bone mask
+    mask = mask & ~lead_metal;
 
     % Fill holes, remove tiny fragments
     mask = imfill(mask, 'holes');
     mask = bwareaopen(mask, 500);
 
     % Scaphoid-style marker carve: remove markers at boundary, protect interior
+    % but never protect voxels overlapping with marker material
     interior = imerode(mask, strel('sphere', 1));
+    interior = interior & ~marker_mask;
     mask = (mask & ~imdilate(marker_mask, strel('sphere', 1))) | interior;
 
     mask = keep_largest_3d(mask);
@@ -542,13 +562,13 @@ function [marker_mask, artifact_w] = marker_and_artifact_maps(HU, sigma_mm, spac
     % Lead letter cores: HU > 1200 (typically 4000-7000 HU)
     lead = HU > 1200;
 
-    % Dense flags/tabs: 700-1200 HU within 3 voxels of lead
-    % (the user reported flag tabs at ~1000 HU — missed by old [200,700] range)
-    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 3));
+    % Dense flags/tabs: 700-1200 HU within 5 voxels of lead
+    % Flags can be ~1mm from the letter; at 0.25mm spacing that's 4 voxels
+    dense_flags = (HU >= 700 & HU <= 1200) & imdilate(lead, strel('sphere', 5));
 
-    % Light flags/housing: 200-700 HU within 2 voxels of lead or dense flags
+    % Light flags/housing: 200-700 HU within 4 voxels of lead or dense flags
     lead_plus_dense = lead | dense_flags;
-    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 2));
+    light_flags = (HU >= 200 & HU <= 700) & imdilate(lead_plus_dense, strel('sphere', 4));
 
     marker_mask = lead | dense_flags | light_flags;
 
@@ -596,6 +616,80 @@ function bones = associate_tags(bones, tags, spacing)
             end
         end
     end
+end
+
+
+% =========================================================================
+%  MERGE NEARBY COMPONENTS (bridges marker-exclusion gaps)
+% =========================================================================
+function CC_out = merge_nearby_components(CC, sz, merge_dist_vox)
+    if CC.NumObjects <= 1
+        CC_out = CC;
+        return;
+    end
+
+    n = CC.NumObjects;
+    parent = 1:n;
+
+    % Check pairwise distances between components
+    dists = cell(n, 1);
+    for i = 1:n
+        m = false(sz);
+        m(CC.PixelIdxList{i}) = true;
+        dists{i} = bwdist(m);
+    end
+
+    for i = 1:n
+        for j = (i+1):n
+            min_d = min(dists{i}(CC.PixelIdxList{j}));
+            if min_d <= merge_dist_vox
+                ri = i; while parent(ri) ~= ri, ri = parent(ri); end
+                rj = j; while parent(rj) ~= rj, rj = parent(rj); end
+                if ri ~= rj
+                    parent(rj) = ri;
+                end
+            end
+        end
+    end
+
+    % Resolve all roots
+    for i = 1:n
+        r = i;
+        while parent(r) ~= r, r = parent(r); end
+        parent(i) = r;
+    end
+
+    % Collect merged groups
+    roots = unique(parent);
+    CC_out = struct();
+    CC_out.Connectivity = CC.Connectivity;
+    CC_out.ImageSize = CC.ImageSize;
+    CC_out.NumObjects = numel(roots);
+    CC_out.PixelIdxList = cell(1, numel(roots));
+    for k = 1:numel(roots)
+        members = find(parent == roots(k));
+        combined = [];
+        for m = 1:numel(members)
+            combined = [combined; CC.PixelIdxList{members(m)}]; %#ok<AGROW>
+        end
+        CC_out.PixelIdxList{k} = combined;
+    end
+end
+
+
+% =========================================================================
+%  SHELL SEALING (ported from scaphoid sealOuterShell)
+% =========================================================================
+function BW = seal_outer_shell(BW, spacing)
+    if ~any(BW(:)), return; end
+
+    rClose = max(1, round(1.5 / max(mean(spacing), eps)));
+    SE = strel('sphere', rClose);
+    BW = imclose(BW, SE);
+    BW = imfill(BW, 'holes');
+
+    BW = keep_largest_3d(BW);
+    BW = imclearborder(BW, 26);
 end
 
 

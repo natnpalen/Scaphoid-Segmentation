@@ -106,69 +106,21 @@ else
 end
 
 % ==== Stage 4: Cortical / Cancellous Segmentation ====
-fprintf('[Stage 4] Cortical / cancellous segmentation...\n');
+% Skipped until bone separation is correct
+fprintf('[Stage 4] Skipped (bone separation still being refined)\n\n');
 seg_results = cell(1, n_bones);
 for bi = 1:n_bones
-    fprintf('  Bone %d/%d:\n', bi, n_bones);
-    [cortical, cancellous, info] = bone.cortical_cancellous(ds, sep_result.bones{bi}.mask, opts);
-    seg_results{bi} = struct('cortical', cortical, 'cancellous', cancellous, 'info', info);
-    fprintf('    Otsu threshold: %.0f HU\n', info.otsu_threshold);
-    fprintf('    Cortical thickness: %.2f mm\n', info.cortical_thickness_mm);
-    fprintf('    Cortical: %.0f mm^3 (%.0f%%)\n', info.cortical_volume_mm3, info.cortical_fraction*100);
-    fprintf('    Cancellous: %.0f mm^3 (%.0f%%)\n\n', info.cancellous_volume_mm3, (1-info.cortical_fraction)*100);
+    seg_results{bi} = struct('cortical', false(size(ds.HU)), ...
+        'cancellous', false(size(ds.HU)), ...
+        'info', struct('otsu_threshold', 0, 'cortical_thickness_mm', 0, ...
+            'cortical_volume_mm3', 0, 'cancellous_volume_mm3', 0, ...
+            'cortical_fraction', 0));
 end
 
 % ==== Stage 5: Specimen Packing ====
-fprintf('[Stage 5] Specimen packing...\n');
-
-% Find STL files
-shape_names = {'Bend', 'Compression', 'Punch', 'Shear'};
-stl_paths = {};
-stl_found = {};
-for si = 1:numel(shape_names)
-    candidates = {
-        fullfile(stlFolder, [shape_names{si} '.STL']);
-        fullfile(stlFolder, [shape_names{si} '.stl']);
-        fullfile(stlFolder, [lower(shape_names{si}) '.stl']);
-        fullfile(stlFolder, [lower(shape_names{si}) '.STL']);
-    };
-    found = false;
-    for ci = 1:numel(candidates)
-        if exist(candidates{ci}, 'file')
-            stl_paths{end+1} = candidates{ci}; %#ok<AGROW>
-            stl_found{end+1} = shape_names{si}; %#ok<AGROW>
-            found = true;
-            fprintf('  Found: %s\n', candidates{ci});
-            break;
-        end
-    end
-    if ~found
-        fprintf('  Warning: %s.STL not found in %s\n', shape_names{si}, stlFolder);
-    end
-end
-
+% Skipped until bone separation is correct
+fprintf('[Stage 5] Skipped (bone separation still being refined)\n\n');
 pack_results = cell(1, n_bones);
-if ~isempty(stl_paths)
-    for bi = 1:n_bones
-        fprintf('\n  Bone %d/%d:\n', bi, n_bones);
-        bone_packs = cell(1, 2);
-
-        % Pack cortical region
-        fprintf('    Cortical region:\n');
-        bone_packs{1} = bone.pack_specimens(seg_results{bi}.cortical, ds, ...
-            stl_paths, stl_found, opts);
-
-        % Pack cancellous region
-        fprintf('    Cancellous region:\n');
-        bone_packs{2} = bone.pack_specimens(seg_results{bi}.cancellous, ds, ...
-            stl_paths, stl_found, opts);
-
-        pack_results{bi} = bone_packs;
-    end
-else
-    fprintf('  No STL files found — skipping packing\n');
-end
-fprintf('\n');
 
 % ==== Stage 6: Visualization ====
 if opts.ShowViewer
@@ -283,17 +235,8 @@ for bi = 1:n_bones
         tag_str = 'no tag';
     end
 
-    n_specimens = 0;
-    if bi <= numel(pack_results) && ~isempty(pack_results{bi})
-        for ri = 1:numel(pack_results{bi})
-            if ~isempty(pack_results{bi}{ri})
-                n_specimens = n_specimens + numel(pack_results{bi}{ri});
-            end
-        end
-    end
-
-    fprintf('  Bone %d: %.0f mm^3 | cort %.0f%% | %s | %d specimens\n', ...
-        bi, b.volume_mm3, seg.info.cortical_fraction*100, tag_str, n_specimens);
+    fprintf('  Bone %d: %.0f mm^3 | mean HU %.0f | dense %.0f%% | %s\n', ...
+        bi, b.volume_mm3, b.mean_hu, b.dense_fraction*100, tag_str);
 end
 fprintf('  Total bone volume: %.0f mm^3\n', total_vol);
 fprintf('============================================================\n');
