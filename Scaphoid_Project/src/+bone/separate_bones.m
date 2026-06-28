@@ -221,6 +221,13 @@ for si = 1:numel(seeds)
     % === Boundary refinement (ported from scaphoid pipeline) ===
     mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, softMed);
 
+    % Remove small disconnected blobs using 6-connectivity (face-touching
+    % only). Corner-connected fragments that look disconnected in the
+    % smoothed STL mesh get eliminated here.
+    min_keep_vox = max(200, round(200 / voxel_vol));
+    mask_bone_L = bwareaopen(mask_bone_L, min_keep_vox, 6);
+    mask_bone_L = keep_largest_3d(mask_bone_L);
+
     if ~any(mask_bone_L(:))
         fprintf('      -> empty after marker carve, skipped\n');
         continue;
