@@ -212,25 +212,14 @@ for si = 1:numel(seeds)
     end
 
     % Remove marker material AFTER sealing (imclose can re-bridge).
-    % Flag carve: within 4mm of lead, remove anything above a sliding
-    % HU threshold that increases with distance (tight near lead, relaxed
-    % further away). Right at the lead surface, even moderate HU (>300)
-    % is flag material; further out, only high HU (>800) is suspicious.
-    flag_hu_thr_L = 300 + 150 * d_lead_L;  % 300 HU at 0mm, 900 HU at 4mm
+    flag_hu_thr_L = 300 + 150 * d_lead_L;
     flag_carve_L = (d_lead_L < 4.0) & (vol_L > flag_hu_thr_L);
     mask_bone_L = mask_bone_L & ~mk_L & ~lead_L & ~flag_carve_L;
-
-    % Morphological opening to remove thin protrusions (tissue strands,
-    % flag bridges) while preserving the bulk bone shape
-    r_open = max(1, round(0.5 / mean(spacing)));
-    mask_bone_L = imopen(mask_bone_L, strel('sphere', r_open));
-
-    % Remove small disconnected fragments (stringy blobs, tissue bits)
-    min_frag_vox = max(50, round(100 / voxel_vol));
-    mask_bone_L = bwareaopen(mask_bone_L, min_frag_vox, 26);
-
     mask_bone_L = imfill(mask_bone_L, 'holes');
     mask_bone_L = keep_largest_3d(mask_bone_L);
+
+    % === Boundary refinement (ported from scaphoid pipeline) ===
+    mask_bone_L = refine_bone_boundary(mask_bone_L, vol_L, G_L, mk_L, spacing, softMed);
 
     if ~any(mask_bone_L(:))
         fprintf('      -> empty after marker carve, skipped\n');
@@ -710,6 +699,90 @@ function CC_out = merge_nearby_components(CC, sz, merge_dist_vox)
         end
         CC_out.PixelIdxList{k} = combined;
     end
+end
+
+
+% =========================================================================
+%  BOUNDARY REFINEMENT (ported from scaphoid cling-prune-carve chain)
+%  Protects the deep interior, aggressively cleans tissue from the surface.
+% =========================================================================
+function mask = refine_bone_boundary(mask, vol, G, marker_mask, spacing, softMed)
+    if ~any(mask(:)), return; end
+    voxmm = mean(spacing);
+
+    % --- Step 1: Boundary-band cling ---
+    % Deep interior (>1mm from surface) is always kept. The outer band
+    % is rebuilt: only voxels connected to high-HU cores AND passing
+    % HU/gradient support survive. Tissue at the surface gets dropped.
+    D_in = bwdist(~mask) * voxmm;
+    deep_interior = D_in >= 1.0;
+    band = mask & ~deep_interior;
+
+    vals = double(vol(~marker_mask & vol > -300 & vol < 2000));
+    if isempty(vals), vals = double(vol(isfinite(vol))); end
+    core_thr = max(240, min(650, prctile(vals, 92)));
+    core_seed = band & (vol > core_thr);
+
+    HU_SUPPORT_MIN = max(60, min(180, softMed + 90));
+    gThr = prctile(G(:), 80);
+    support = band & ((vol > HU_SUPPORT_MIN) | (G > gThr));
+
+    if any(core_seed(:))
+        cling_band = imreconstruct(core_seed, support);
+    else
+        cling_band = support;
+    end
+    mask = deep_interior | cling_band;
+    mask = keep_largest_3d(mask);
+    mask = imclose(mask, strel('sphere', 1));
+    mask = imfill(mask, 'holes');
+
+    % --- Step 2: Edge-backed perimeter prune ---
+    % Kill perimeter voxels with BOTH low HU AND low gradient.
+    % Tissue has low HU + smooth gradients; cortical bone has high gradient.
+    perim = bwperim(mask, 26);
+    band1 = imdilate(perim, strel('sphere', 1));
+    T_hu = max(160, min(340, softMed + 190));
+    T_g = prctile(G(:), 70);
+    kill = band1 & (double(vol) < T_hu) & (G < T_g);
+    if any(kill(:))
+        mask(kill) = false;
+        mask = keep_largest_3d(mask);
+        mask = imclose(mask, strel('sphere', 1));
+        mask = imfill(mask, 'holes');
+    end
+
+    % --- Step 3: Conservative boundary carve ---
+    % Kill surface voxels with low HU near air, not protected by dense core.
+    perim = bwperim(mask, 26);
+    band1 = imdilate(perim, strel('sphere', 1));
+    outer1 = imdilate(mask, strel('sphere', 1)) & ~mask;
+    protected_core = imdilate(vol > core_thr, strel('sphere', 2));
+    T_hi = max(170, min(360, softMed + 210));
+    T_lo = T_hi - 80;
+    airNear = outer1 & imdilate(vol < -300, strel('sphere', 1));
+    kill = band1 & (double(vol) < T_lo) & imdilate(airNear, strel('sphere', 1)) & ~protected_core;
+    if any(kill(:))
+        mask(kill) = false;
+        mask = keep_largest_3d(mask);
+        mask = imclose(mask, strel('sphere', 1));
+        mask = imfill(mask, 'holes');
+    end
+
+    % --- Step 4: Final boundary carve ---
+    band1 = imdilate(bwperim(mask, 26), strel('sphere', 1));
+    HU_CARVE_FLOOR = max(180, min(400, softMed + 220));
+    kill = band1 & (double(vol) < HU_CARVE_FLOOR);
+    if any(kill(:))
+        mask(kill) = false;
+    end
+
+    % --- Step 5: Final cleanup ---
+    mask = keep_largest_3d(mask);
+    mask = imopen(mask, strel('sphere', 1));
+    mask = keep_largest_3d(mask);
+    mask = imclose(mask, strel('sphere', 1));
+    mask = imfill(mask, 'holes');
 end
 
 
