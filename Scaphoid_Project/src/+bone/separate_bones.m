@@ -212,10 +212,23 @@ for si = 1:numel(seeds)
     end
 
     % Remove marker material AFTER sealing (imclose can re-bridge).
-    % Also carve flag-like material near lead: voxels within 4mm of lead
-    % with HU > 600 are almost certainly flag tabs, not bone.
-    flag_carve_L = (d_lead_L < 4.0) & (vol_L > 600);
+    % Flag carve: within 4mm of lead, remove anything above a sliding
+    % HU threshold that increases with distance (tight near lead, relaxed
+    % further away). Right at the lead surface, even moderate HU (>300)
+    % is flag material; further out, only high HU (>800) is suspicious.
+    flag_hu_thr_L = 300 + 150 * d_lead_L;  % 300 HU at 0mm, 900 HU at 4mm
+    flag_carve_L = (d_lead_L < 4.0) & (vol_L > flag_hu_thr_L);
     mask_bone_L = mask_bone_L & ~mk_L & ~lead_L & ~flag_carve_L;
+
+    % Morphological opening to remove thin protrusions (tissue strands,
+    % flag bridges) while preserving the bulk bone shape
+    r_open = max(1, round(0.5 / mean(spacing)));
+    mask_bone_L = imopen(mask_bone_L, strel('sphere', r_open));
+
+    % Remove small disconnected fragments (stringy blobs, tissue bits)
+    min_frag_vox = max(50, round(100 / voxel_vol));
+    mask_bone_L = bwareaopen(mask_bone_L, min_frag_vox, 26);
+
     mask_bone_L = imfill(mask_bone_L, 'holes');
     mask_bone_L = keep_largest_3d(mask_bone_L);
 
