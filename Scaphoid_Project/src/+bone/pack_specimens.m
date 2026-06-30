@@ -5,17 +5,8 @@ function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_p
 %       stl_paths, shape_names, opts, bone_axis)
 %
 % Uses true mesh geometry for fitting: rotates STL vertices first, then
-% voxelizes the rotated mesh. This avoids both OBB volume waste and
-% voxel-rotation deformation artifacts. The actual STL mesh (vertices +
-% faces) is stored with each placement for accurate visualization.
-%
-% Strategy:
-%   1. Read each STL mesh and rotate vertices to bone-aligned orientations
-%   2. Voxelize each rotated mesh at CT resolution (scanline fill)
-%   3. For each region (cortical, cancellous):
-%      a. Place one of each specimen type first (priority constraint)
-%      b. Then greedily pack additional specimens to maximize count
-%   4. No overlap between placements within a region
+% voxelizes the rotated mesh. Crops regions to their bounding box before
+% convolution for speed, then maps results back to full-volume coordinates.
 
 spacing = ds.spacing;
 vol = double(ds.HU);
@@ -50,8 +41,6 @@ for si = 1:n_shapes
     n_valid = 0;
     for oi = 1:n_orient
         R = rotations(:,:,oi);
-
-        % Rotate mesh vertices, then voxelize the rotated mesh
         V_rot = (R * V_raw')';
         [shape_mask, ~] = voxelize_mesh(V_rot, F, spacing);
 
@@ -63,11 +52,6 @@ for si = 1:n_shapes
         tpl.shape_name = shape_names{si};
         tpl.orientation = oi;
         tpl.rotation = R;
-        % Store the voxel-space offset used during voxelization so we can
-        % reconstruct the mesh position when placing
-        V_vox_tmp = [V_rot(:,1)/spacing(1), V_rot(:,2)/spacing(2), V_rot(:,3)/spacing(3)];
-        vox_origin = min(V_vox_tmp, [], 1) - 2;  % the shift applied: V_vox = V/sp - vox_origin
-        tpl.vox_origin = vox_origin;
         tpl.vertices_mm = V_rot;
         tpl.faces = F;
         tpl.mask = shape_mask;
@@ -120,9 +104,6 @@ end
 %  VOXELIZE ROTATED MESH (inline, no file I/O)
 % =========================================================================
 function [vox_mask, grid_sz] = voxelize_mesh(V, F, spacing)
-% Voxelize a mesh given as V (vertices in mm) and F (face connectivity).
-% Same scanline algorithm as bone.voxelize_stl but operates on in-memory
-% vertices instead of reading from a file.
 
     V_vox = zeros(size(V));
     V_vox(:,1) = V(:,1) / spacing(1);
@@ -191,7 +172,7 @@ end
 
 
 % =========================================================================
-%  REGION PACKING
+%  REGION PACKING (with bounding-box crop for speed)
 % =========================================================================
 function placements = pack_region(region, templates, vol, spacing, shape_names, n_shapes)
 
@@ -223,7 +204,7 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
         end
     end
 
-    % Phase 2: greedily pack more specimens (any type)
+    % Phase 2: greedily pack more specimens
     max_additional = 50;
     for attempt = 1:max_additional
         if ~any(available(:)), break; end
@@ -242,7 +223,7 @@ end
 
 
 % =========================================================================
-%  PLACEMENT SEARCH (convolution-based with true mesh masks)
+%  PLACEMENT SEARCH (convolution on cropped ROI for speed)
 % =========================================================================
 function [placement, available] = try_place_best(available, templates, vol, spacing)
 
@@ -251,23 +232,45 @@ function [placement, available] = try_place_best(available, templates, vol, spac
     best_pos = [];
     best_tpl = [];
 
-    vol_sz = size(available);
+    full_sz = size(available);
+
+    % Crop available region to its bounding box (with padding for templates)
+    max_tpl_sz = [0 0 0];
+    for ti = 1:numel(templates)
+        max_tpl_sz = max(max_tpl_sz, templates{ti}.sz);
+    end
+
+    [rr, cc, ss] = ind2sub(full_sz, find(available));
+    if isempty(rr), return; end
+    pad = max_tpl_sz;
+    roi_min = max([1 1 1], [min(rr) min(cc) min(ss)] - pad);
+    roi_max = min(full_sz, [max(rr) max(cc) max(ss)] + pad);
+
+    avail_crop = available(roi_min(1):roi_max(1), roi_min(2):roi_max(2), roi_min(3):roi_max(3));
+    vol_crop = vol(roi_min(1):roi_max(1), roi_min(2):roi_max(2), roi_min(3):roi_max(3));
+    crop_sz = size(avail_crop);
+
+    D_crop = bwdist(~avail_crop) .* mean(spacing);
 
     for ti = 1:numel(templates)
         tpl = templates{ti};
         tsz = tpl.sz;
 
-        if any(tsz > vol_sz), continue; end
+        if any(tsz > crop_sz), continue; end
+
+        % Quick volume check: skip if template is larger than remaining region
+        if tpl.volume_mm3 > sum(avail_crop(:)) * prod(spacing) * 1.1
+            continue;
+        end
 
         n_template_vox = sum(tpl.mask(:));
-        overlap_count = convn(single(available), flip_3d(single(tpl.mask)), 'valid');
+        overlap_count = convn(single(avail_crop), flip_3d(single(tpl.mask)), 'valid');
         fit_frac = overlap_count / max(1, n_template_vox);
 
         good_fit = fit_frac >= 0.95;
         if ~any(good_fit(:)), continue; end
 
-        D = bwdist(~available) .* mean(spacing);
-        depth_sum = convn(single(D), flip_3d(single(tpl.mask)), 'valid');
+        depth_sum = convn(single(D_crop), flip_3d(single(tpl.mask)), 'valid');
         avg_depth = depth_sum / max(1, n_template_vox);
 
         score_map = fit_frac + avg_depth;
@@ -277,7 +280,8 @@ function [placement, available] = try_place_best(available, templates, vol, spac
         if local_best > best_score
             [pr, pc, ps] = ind2sub(size(score_map), linear_idx);
             best_score = local_best;
-            best_pos = [pr, pc, ps];
+            % Map crop position back to full volume coordinates
+            best_pos = [pr + roi_min(1) - 1, pc + roi_min(2) - 1, ps + roi_min(3) - 1];
             best_tpl = tpl;
         end
     end
@@ -290,7 +294,7 @@ function [placement, available] = try_place_best(available, templates, vol, spac
     c2 = c1 + tsz(2) - 1;
     s2 = s1 + tsz(3) - 1;
 
-    placed_mask = false(vol_sz);
+    placed_mask = false(full_sz);
     placed_mask(r1:r2, c1:c2, s1:s2) = best_tpl.mask;
     placed_mask = placed_mask & available;
 
@@ -299,17 +303,17 @@ function [placement, available] = try_place_best(available, templates, vol, spac
     end
 
     % Reconstruct placed mesh vertices in volume mm coordinates.
-    % During voxelization: V_vox = V_mm/spacing - vox_origin
-    % Template mask(1,1,1) corresponds to vox_origin in the mesh's voxel space.
-    % Convolution places template(1,1,1) at volume position (r1,c1,s1).
-    % So mesh voxel coordinate = V_mm/spacing - vox_origin, placed at (r1,c1,s1):
-    %   V_vol_vox = V_mm/spacing - vox_origin + (r1-1, c1-1, s1-1)
-    %   V_vol_mm  = V_vol_vox * spacing
-    vo = best_tpl.vox_origin;
-    V_placed = best_tpl.vertices_mm;
-    V_placed(:,1) = V_placed(:,1) + (r1 - 1 + vo(1)) * spacing(1);
-    V_placed(:,2) = V_placed(:,2) + (c1 - 1 + vo(2)) * spacing(2);
-    V_placed(:,3) = V_placed(:,3) + (s1 - 1 + vo(3)) * spacing(3);
+    % Voxelization does: V_vox = V_mm./spacing - min(V_mm./spacing) + 2
+    % So template voxel = V_mm./spacing - min(V_mm./spacing) + 2
+    % Template voxel (i,j,k) placed at volume voxel (r1+i-1, c1+j-1, s1+k-1)
+    % Volume voxel of vertex = V_mm./spacing - min(V_mm./spacing) + 2 + [r1-1, c1-1, s1-1]
+    % Volume mm = volume_voxel .* spacing
+    V_mm = best_tpl.vertices_mm;
+    V_vox_local = [V_mm(:,1)/spacing(1), V_mm(:,2)/spacing(2), V_mm(:,3)/spacing(3)];
+    min_vox = min(V_vox_local, [], 1);
+    V_vox_template = V_vox_local - min_vox + 2;
+    V_vol_vox = V_vox_template + [r1-1, c1-1, s1-1];
+    V_placed = [V_vol_vox(:,1)*spacing(1), V_vol_vox(:,2)*spacing(2), V_vol_vox(:,3)*spacing(3)];
 
     placement = struct();
     placement.shape_name = best_tpl.shape_name;
