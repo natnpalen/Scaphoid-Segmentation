@@ -155,27 +155,19 @@ if has_pack
 
         for pi = 1:numel(all_placements)
             p = all_placements(pi);
-            if ~isfield(p, 'position_vox'), continue; end
+            if ~isfield(p, 'vertices_mm') || isempty(p.vertices_mm), continue; end
             try
-                pos = p.position_vox;
-                bsz = p.obb_vox;
+                V = p.vertices_mm;
+                F = p.faces;
 
-                % Box corners in voxel coords, scaled to mm
-                x1 = pos(2) * spacing(2);  x2 = (pos(2) + bsz(2) - 1) * spacing(2);
-                y1 = pos(1) * spacing(1);  y2 = (pos(1) + bsz(1) - 1) * spacing(1);
-                z1 = pos(3) * spacing(3);  z2 = (pos(3) + bsz(3) - 1) * spacing(3);
-
-                verts = [x1 y1 z1; x2 y1 z1; x2 y2 z1; x1 y2 z1;
-                         x1 y1 z2; x2 y1 z2; x2 y2 z2; x1 y2 z2];
-                faces = [1 2 3 4; 5 6 7 8; 1 2 6 5; 3 4 8 7; 1 4 8 5; 2 3 7 6];
-
+                % Swap X/Y for MATLAB's row/col convention in 3D plots
                 ci = mod(p.shape_idx - 1, size(spec_colors,1)) + 1;
-                patch('Vertices', verts, 'Faces', faces, ...
-                    'FaceColor', spec_colors(ci,:), 'EdgeColor', spec_colors(ci,:)*0.5, ...
-                    'FaceAlpha', 0.6, 'LineWidth', 1.5);
+                patch('Vertices', [V(:,2) V(:,1) V(:,3)], 'Faces', F, ...
+                    'FaceColor', spec_colors(ci,:), 'EdgeColor', 'none', ...
+                    'FaceAlpha', 0.7);
 
-                center = [(x1+x2)/2, (y1+y2)/2, (z1+z2)/2];
-                text(center(1), center(2), center(3), p.shape_name, ...
+                cm = mean(V, 1);
+                text(cm(2), cm(1), cm(3), p.shape_name, ...
                     'FontSize', 7, 'FontWeight', 'bold', ...
                     'HorizontalAlignment', 'center', 'Color', 'k');
             catch, end
