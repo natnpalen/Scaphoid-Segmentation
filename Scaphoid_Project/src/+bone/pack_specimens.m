@@ -1,234 +1,314 @@
-function placements = pack_specimens(region_mask, ds, stl_paths, shape_names, opts)
-% PACK_SPECIMENS  Greedy mixed packing of mechanical test specimens into a bone region.
+function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_paths, shape_names, opts, bone_axis)
+% PACK_SPECIMENS  Pack mechanical test specimens into cortical and cancellous regions.
 %
-%   placements = bone.pack_specimens(region_mask, ds, stl_paths, shape_names, opts)
+%   pack_result = bone.pack_specimens(bone_mask, cortical, cancellous, ds, ...
+%       stl_paths, shape_names, opts, bone_axis)
 %
-% All specimen shapes compete for the SAME volume (mixed packing, no overlaps).
-% Uses distance-transform-guided placement: specimens are placed at the
-% deepest available interior point first, maximizing packing density.
+% Places all 4 specimen types (Bend, Compression, Punch, Shear) into both
+% cortical and cancellous regions. Uses convolution-based fit scoring for
+% fast placement, with orientations aligned to the bone's principal axis.
+%
+% Strategy:
+%   1. Voxelize each STL specimen at bone-aligned orientations
+%   2. For each region (cortical, cancellous):
+%      a. Place one of each specimen type first (priority constraint)
+%      b. Then greedily pack additional specimens to maximize count
+%   3. No overlap between placements within a region
 %
 % Inputs
-%   region_mask  : logical 3D mask (cortical or cancellous region)
+%   bone_mask    : logical 3D full bone mask
+%   cortical     : logical 3D cortical region
+%   cancellous   : logical 3D cancellous region
 %   ds           : dataset struct from dicom.series_load
 %   stl_paths    : cell array of STL file paths
-%   shape_names  : cell array of shape names (e.g. {'Bend','Compression','Punch','Shear'})
-%   opts         : pipeline options struct with PackingOrientations, PackingMinDepthMM
+%   shape_names  : cell array of shape names
+%   opts         : pipeline options struct
+%   bone_axis    : [3x1] principal axis direction from PCA
 %
 % Output
-%   placements   : struct array with fields .shape_name, .shape_idx,
-%                  .position_vox, .orientation, .mask, .volume_mm3, .mean_hu
+%   pack_result  : struct with .cortical_placements, .cancellous_placements,
+%                  .summary
 
 spacing = ds.spacing;
 vol = double(ds.HU);
 voxel_vol = prod(spacing);
 n_shapes = numel(stl_paths);
 
-region_vol = sum(region_mask(:)) * voxel_vol;
-fprintf('      Region volume: %.0f mm^3\n', region_vol);
+cort_vol = sum(cortical(:)) * voxel_vol;
+canc_vol = sum(cancellous(:)) * voxel_vol;
+fprintf('      Cortical region: %.0f mm^3\n', cort_vol);
+fprintf('      Cancellous region: %.0f mm^3\n', canc_vol);
 
-if region_vol < 1.0
-    placements = struct([]);
-    return;
-end
+% ---- Voxelize all shapes at bone-aligned orientations ----
+fprintf('      Voxelizing %d specimen types...\n', n_shapes);
+rotations = generate_bone_aligned_rotations(bone_axis, opts.PackingOrientations);
+n_orient = size(rotations, 3);
 
-% ---- Voxelize all shapes at all orientations ----
-fprintf('      Voxelizing %d shapes...\n', n_shapes);
-candidates = {};
-
-% Standard orientations: identity + 90-degree rotations about each axis
-n_orient = opts.PackingOrientations;
-rotations = generate_rotations(n_orient);
-
+templates = {};
 for si = 1:n_shapes
     fprintf('        %s: ', shape_names{si});
-    for oi = 1:size(rotations, 3)
+    n_valid = 0;
+    for oi = 1:n_orient
         try
             [shape_mask, ~] = bone.voxelize_stl(stl_paths{si}, spacing);
             if oi > 1
                 shape_mask = rotate_mask_3d(shape_mask, rotations(:,:,oi));
             end
             shape_vol = sum(shape_mask(:)) * voxel_vol;
-            if shape_vol < 0.1
-                fprintf('(empty voxelization) ');
-                continue;
-            end
+            if shape_vol < 0.1, continue; end
 
-            cand = struct();
-            cand.shape_idx = si;
-            cand.shape_name = shape_names{si};
-            cand.orientation = oi;
-            cand.template = shape_mask;
-            cand.volume_mm3 = shape_vol;
-            cand.size_vox = size(shape_mask);
-            candidates{end+1} = cand; %#ok<AGROW>
-        catch ME
-            if oi == 1
-                fprintf('(error: %s) ', ME.message);
-            end
+            tpl = struct();
+            tpl.shape_idx = si;
+            tpl.shape_name = shape_names{si};
+            tpl.orientation = oi;
+            tpl.mask = shape_mask;
+            tpl.volume_mm3 = shape_vol;
+            tpl.sz = size(shape_mask);
+            templates{end+1} = tpl; %#ok<AGROW>
+            n_valid = n_valid + 1;
+        catch
             continue;
         end
     end
-    fprintf('%d orientations\n', sum(cellfun(@(c) c.shape_idx == si, candidates)));
+    fprintf('%d orientations (%.0f mm^3)\n', n_valid, ...
+        ternary(n_valid > 0, templates{end}.volume_mm3, 0));
 end
 
-fprintf('      %d candidate templates total\n', numel(candidates));
+fprintf('      %d total templates\n', numel(templates));
 
-% ---- Greedy packing ----
-available = region_mask;
-placements = struct([]);
-max_attempts = 200;
-
-for attempt = 1:max_attempts
-    if ~any(available(:)), break; end
-
-    % Distance transform of available region
-    D = bwdist(~available) .* mean(spacing);
-
-    % Try each candidate at the deepest interior point
-    best_score = -Inf;
-    best_placement = [];
-
-    for ci = 1:numel(candidates)
-        cand = candidates{ci};
-        sz = cand.size_vox;
-
-        % Find the deepest point with enough clearance
-        min_depth = opts.PackingMinDepthMM;
-        deep_enough = D >= min_depth;
-        if ~any(deep_enough(:)), continue; end
-
-        % Find best placement position
-        [score, pos] = find_best_position(available, cand.template, D, spacing);
-
-        if score > best_score && ~isempty(pos)
-            best_score = score;
-            placed = struct();
-            placed.shape_name = cand.shape_name;
-            placed.shape_idx = cand.shape_idx;
-            placed.orientation = cand.orientation;
-            placed.position_vox = pos;
-            placed.volume_mm3 = cand.volume_mm3;
-
-            % Build placed mask
-            sz = cand.size_vox;
-            r1 = pos(1); r2 = pos(1) + sz(1) - 1;
-            c1 = pos(2); c2 = pos(2) + sz(2) - 1;
-            s1 = pos(3); s2 = pos(3) + sz(3) - 1;
-
-            if r2 <= size(available,1) && c2 <= size(available,2) && s2 <= size(available,3)
-                placed_mask = false(size(available));
-                placed_mask(r1:r2, c1:c2, s1:s2) = cand.template;
-                placed_mask = placed_mask & available;
-
-                if sum(placed_mask(:)) >= 0.9 * sum(cand.template(:))
-                    placed.mask = placed_mask;
-                    placed.mean_hu = mean(vol(placed_mask));
-                    best_placement = placed;
-                end
-            end
-        end
-    end
-
-    if isempty(best_placement), break; end
-
-    % Place the specimen
-    if isempty(placements)
-        placements = best_placement;
-    else
-        placements(end+1) = best_placement; %#ok<AGROW>
-    end
-    available(best_placement.mask) = false;
-
-    fprintf('      Placed %s (#%d) at [%d %d %d], %.1f mm^3\n', ...
-        best_placement.shape_name, numel(placements), ...
-        best_placement.position_vox, best_placement.volume_mm3);
+if isempty(templates)
+    pack_result = empty_result();
+    return;
 end
 
-fprintf('      Total: %d specimens placed\n', numel(placements));
+% ---- Pack each region ----
+fprintf('      --- Cortical packing ---\n');
+cort_placements = pack_region(cortical, templates, vol, spacing, shape_names, n_shapes);
+
+fprintf('      --- Cancellous packing ---\n');
+canc_placements = pack_region(cancellous, templates, vol, spacing, shape_names, n_shapes);
+
+% ---- Build result ----
+pack_result = struct();
+pack_result.cortical_placements = cort_placements;
+pack_result.cancellous_placements = canc_placements;
+pack_result.n_cortical = numel(cort_placements);
+pack_result.n_cancellous = numel(canc_placements);
+pack_result.n_total = numel(cort_placements) + numel(canc_placements);
+
+% Summary by type
+pack_result.summary = struct();
+for si = 1:n_shapes
+    n_cort = sum(arrayfun(@(p) p.shape_idx == si, cort_placements));
+    n_canc = sum(arrayfun(@(p) p.shape_idx == si, canc_placements));
+    pack_result.summary.(shape_names{si}) = struct('cortical', n_cort, 'cancellous', n_canc);
+    fprintf('      %s: %d cortical + %d cancellous = %d total\n', ...
+        shape_names{si}, n_cort, n_canc, n_cort + n_canc);
+end
+
+fprintf('      TOTAL: %d specimens (%d cortical + %d cancellous)\n', ...
+    pack_result.n_total, pack_result.n_cortical, pack_result.n_cancellous);
 end
 
 
 % =========================================================================
-function [score, best_pos] = find_best_position(available, template, D, spacing)
-    score = -Inf;
-    best_pos = [];
+%  REGION PACKING
+% =========================================================================
+function placements = pack_region(region, templates, vol, spacing, shape_names, n_shapes)
+% Greedy packing into a single region. Priority: one of each type first.
 
-    sz = size(template);
-    vol_sz = size(available);
+    voxel_vol = prod(spacing);
+    region_vol = sum(region(:)) * voxel_vol;
+    placements = struct('shape_name', {}, 'shape_idx', {}, 'orientation', {}, ...
+        'position_vox', {}, 'volume_mm3', {}, 'mean_hu', {}, 'mask', {});
 
-    % Stride: check every few voxels for speed
-    stride = max(1, round(1.0 ./ spacing));
+    if region_vol < 1.0
+        fprintf('        Region too small (%.0f mm^3), skipping\n', region_vol);
+        return;
+    end
 
-    % Get candidate positions from distance-transform peaks
-    D_smooth = imgaussfilt3(D, 1);
+    available = region;
+    types_placed = false(1, n_shapes);
 
-    for r = 1:stride(1):(vol_sz(1) - sz(1) + 1)
-        for c = 1:stride(2):(vol_sz(2) - sz(2) + 1)
-            for s = 1:stride(3):(vol_sz(3) - sz(3) + 1)
-                % Check center depth
-                cr = r + floor(sz(1)/2);
-                cc = c + floor(sz(2)/2);
-                cs = s + floor(sz(3)/2);
+    % Phase 1: one of each type (priority)
+    for si = 1:n_shapes
+        type_templates = cellfun(@(t) t.shape_idx == si, templates);
+        type_idx = find(type_templates);
+        if isempty(type_idx), continue; end
 
-                if cr > vol_sz(1) || cc > vol_sz(2) || cs > vol_sz(3)
-                    continue;
-                end
-
-                center_depth = D_smooth(cr, cc, cs);
-                if center_depth < 0.3, continue; end
-
-                % Check if template fits
-                region = available(r:r+sz(1)-1, c:c+sz(2)-1, s:s+sz(3)-1);
-                overlap = template & region;
-                fit_frac = sum(overlap(:)) / max(1, sum(template(:)));
-
-                if fit_frac >= 0.95
-                    s_val = center_depth * fit_frac;
-                    if s_val > score
-                        score = s_val;
-                        best_pos = [r c s];
-                    end
-                end
-            end
+        [p, available] = try_place_best(available, templates(type_idx), vol, spacing);
+        if ~isempty(p)
+            placements(end+1) = p; %#ok<AGROW>
+            types_placed(si) = true;
+            fprintf('        [priority] Placed %s at [%d %d %d] (%.0f mm^3)\n', ...
+                p.shape_name, p.position_vox, p.volume_mm3);
+        else
+            fprintf('        [priority] %s: does not fit\n', shape_names{si});
         end
     end
+
+    % Phase 2: greedily pack more specimens (any type)
+    max_additional = 50;
+    for attempt = 1:max_additional
+        if ~any(available(:)), break; end
+
+        [p, available] = try_place_best(available, templates, vol, spacing);
+        if isempty(p), break; end
+
+        placements(end+1) = p; %#ok<AGROW>
+        fprintf('        [greedy] Placed %s at [%d %d %d] (%.0f mm^3)\n', ...
+            p.shape_name, p.position_vox, p.volume_mm3);
+    end
+
+    fprintf('        Total: %d specimens in %.0f mm^3 region\n', ...
+        numel(placements), region_vol);
 end
 
 
-function R = generate_rotations(n)
-    % Generate n distinct 90-degree rotation matrices
-    % For n <= 6: identity + 90 deg about each axis (positive and negative)
-    R = zeros(3, 3, min(n, 24));
-    R(:,:,1) = eye(3);  % identity
-    idx = 1;
+% =========================================================================
+%  PLACEMENT SEARCH (convolution-based)
+% =========================================================================
+function [placement, available] = try_place_best(available, templates, vol, spacing)
+% Find the best placement among all templates using convolution scoring.
 
-    if n >= 2
-        idx = idx + 1;
-        R(:,:,idx) = [1 0 0; 0 0 -1; 0 1 0];  % 90 about X
+    placement = [];
+    best_score = -Inf;
+    best_pos = [];
+    best_tpl = [];
+    best_placed_mask = [];
+
+    vol_sz = size(available);
+
+    for ti = 1:numel(templates)
+        tpl = templates{ti};
+        tsz = tpl.sz;
+
+        % Template must fit within volume dimensions
+        if any(tsz > vol_sz), continue; end
+
+        % Convolution: count how many template voxels overlap available region
+        % convn with 'valid' mode gives overlap at every valid position
+        overlap_count = convn(single(available), flip_3d(single(tpl.mask)), 'valid');
+        n_template_vox = sum(tpl.mask(:));
+
+        % Fit fraction at each position
+        fit_frac = overlap_count / max(1, n_template_vox);
+
+        % Require >= 95% fit
+        good_fit = fit_frac >= 0.95;
+        if ~any(good_fit(:)), continue; end
+
+        % Score by depth: prefer placements deep inside the region
+        D = bwdist(~available) .* mean(spacing);
+        % Average depth at each candidate position via convolution
+        depth_sum = convn(single(D), flip_3d(single(tpl.mask)), 'valid');
+        avg_depth = depth_sum / max(1, n_template_vox);
+
+        % Combined score: fit fraction + average depth
+        score_map = fit_frac + avg_depth;
+        score_map(~good_fit) = -Inf;
+
+        [local_best, linear_idx] = max(score_map(:));
+        if local_best > best_score
+            [pr, pc, ps] = ind2sub(size(score_map), linear_idx);
+            best_score = local_best;
+            best_pos = [pr, pc, ps];
+            best_tpl = tpl;
+        end
     end
-    if n >= 3
-        idx = idx + 1;
-        R(:,:,idx) = [0 0 1; 0 1 0; -1 0 0];   % 90 about Y
+
+    if isempty(best_pos), return; end
+
+    % Build placed mask
+    r1 = best_pos(1); c1 = best_pos(2); s1 = best_pos(3);
+    tsz = best_tpl.sz;
+    r2 = r1 + tsz(1) - 1;
+    c2 = c1 + tsz(2) - 1;
+    s2 = s1 + tsz(3) - 1;
+
+    placed_mask = false(vol_sz);
+    placed_mask(r1:r2, c1:c2, s1:s2) = best_tpl.mask;
+    placed_mask = placed_mask & available;
+
+    % Verify fit
+    if sum(placed_mask(:)) < 0.90 * sum(best_tpl.mask(:))
+        return;
     end
-    if n >= 4
-        idx = idx + 1;
-        R(:,:,idx) = [0 -1 0; 1 0 0; 0 0 1];   % 90 about Z
+
+    placement = struct();
+    placement.shape_name = best_tpl.shape_name;
+    placement.shape_idx = best_tpl.shape_idx;
+    placement.orientation = best_tpl.orientation;
+    placement.position_vox = best_pos;
+    placement.volume_mm3 = best_tpl.volume_mm3;
+    placement.mean_hu = mean(vol(placed_mask));
+    placement.mask = placed_mask;
+
+    % Remove placed voxels from available
+    available(placed_mask) = false;
+end
+
+
+function flipped = flip_3d(A)
+    flipped = flip(flip(flip(A, 1), 2), 3);
+end
+
+
+% =========================================================================
+%  BONE-ALIGNED ROTATIONS
+% =========================================================================
+function R = generate_bone_aligned_rotations(bone_axis, n_orient)
+% Generate rotations that align the specimen's Z-axis with the bone's
+% principal axis, plus 90-degree rotations about and perpendicular to it.
+
+    bone_axis = bone_axis(:) / norm(bone_axis);
+
+    % Build orthonormal frame: bone_axis = new Z
+    if abs(bone_axis(1)) < 0.9
+        perp = cross(bone_axis, [1;0;0]);
+    else
+        perp = cross(bone_axis, [0;1;0]);
     end
-    if n >= 5
-        idx = idx + 1;
-        R(:,:,idx) = [1 0 0; 0 -1 0; 0 0 -1];  % 180 about X
-    end
-    if n >= 6
-        idx = idx + 1;
-        R(:,:,idx) = [-1 0 0; 0 1 0; 0 0 -1];  % 180 about Y
+    perp = perp / norm(perp);
+    perp2 = cross(bone_axis, perp);
+    perp2 = perp2 / norm(perp2);
+
+    % Base rotation: align specimen Z with bone axis
+    R_base = [perp, perp2, bone_axis]';  % 3x3
+
+    % Generate additional rotations by rotating about bone axis
+    R = zeros(3, 3, min(n_orient, 12));
+    idx = 0;
+
+    angles_about_axis = [0, 90, 180, 270];  % degrees
+    angles_perpendicular = [0, 90];          % tip specimen sideways
+
+    for ai = 1:numel(angles_about_axis)
+        for pi = 1:numel(angles_perpendicular)
+            idx = idx + 1;
+            if idx > n_orient, break; end
+
+            theta = deg2rad(angles_about_axis(ai));
+            phi = deg2rad(angles_perpendicular(pi));
+
+            % Rotation about bone axis
+            Rz = [cos(theta) -sin(theta) 0; sin(theta) cos(theta) 0; 0 0 1];
+            % Rotation about perp axis (tip)
+            Rx = [1 0 0; 0 cos(phi) -sin(phi); 0 sin(phi) cos(phi)];
+
+            R(:,:,idx) = R_base * Rz * Rx;
+        end
+        if idx >= n_orient, break; end
     end
 
     R = R(:,:,1:idx);
 end
 
 
+% =========================================================================
+%  MASK ROTATION
+% =========================================================================
 function rotated = rotate_mask_3d(mask, R)
-    % Rotate a 3D binary mask by rotation matrix R (90-degree rotations only)
     sz = size(mask);
     center = (sz + 1) / 2;
 
@@ -237,7 +317,6 @@ function rotated = rotate_mask_3d(mask, R)
     coords_rot = coords * R';
 
     new_coords = round(coords_rot);
-    new_center = round((max(new_coords, [], 1) - min(new_coords, [], 1) + 1) / 2) + 1;
     new_coords = new_coords - min(new_coords, [], 1) + 1;
 
     new_sz = max(new_coords, [], 1);
@@ -251,6 +330,25 @@ function rotated = rotate_mask_3d(mask, R)
     idx = sub2ind(new_sz, new_coords(valid,1), new_coords(valid,2), new_coords(valid,3));
     rotated(idx) = true;
 
-    % Fill gaps from rotation
     rotated = imclose(rotated, strel('sphere', 1));
+end
+
+
+% =========================================================================
+%  UTILITIES
+% =========================================================================
+function r = empty_result()
+    r = struct();
+    r.cortical_placements = struct('shape_name', {}, 'shape_idx', {}, ...
+        'orientation', {}, 'position_vox', {}, 'volume_mm3', {}, ...
+        'mean_hu', {}, 'mask', {});
+    r.cancellous_placements = r.cortical_placements;
+    r.n_cortical = 0;
+    r.n_cancellous = 0;
+    r.n_total = 0;
+    r.summary = struct();
+end
+
+function s = ternary(cond, a, b)
+    if cond, s = a; else, s = b; end
 end

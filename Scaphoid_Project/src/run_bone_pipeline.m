@@ -123,9 +123,55 @@ end
 fprintf('\n');
 
 % ==== Stage 5: Specimen Packing ====
-% Skipped until bone separation is correct
-fprintf('[Stage 5] Skipped (bone separation still being refined)\n\n');
-pack_results = cell(1, n_bones);
+fprintf('[Stage 5] Specimen packing...\n');
+
+% Discover STL specimen files
+stl_names = {'Bend', 'Compression', 'Punch', 'Shear'};
+stl_paths = {};
+stl_found = {};
+for si = 1:numel(stl_names)
+    candidates = {fullfile(stlFolder, [stl_names{si} '.STL']), ...
+                  fullfile(stlFolder, [stl_names{si} '.stl'])};
+    for ci = 1:numel(candidates)
+        if exist(candidates{ci}, 'file')
+            stl_paths{end+1} = candidates{ci}; %#ok<AGROW>
+            stl_found{end+1} = stl_names{si}; %#ok<AGROW>
+            break;
+        end
+    end
+end
+
+if isempty(stl_paths)
+    fprintf('  No STL specimen files found in: %s\n', stlFolder);
+    fprintf('  Expected: Bend.STL, Compression.STL, Punch.STL, Shear.STL\n');
+    fprintf('[Stage 5] Skipped (no specimen files)\n\n');
+    pack_results = cell(1, n_bones);
+else
+    fprintf('  Found %d specimen types: %s\n', numel(stl_found), strjoin(stl_found, ', '));
+    pack_results = cell(1, n_bones);
+    for bi = 1:n_bones
+        fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
+            sep_result.bones{bi}.volume_mm3);
+
+        bone_axis = [0; 0; 1];  % default
+        if isfield(seg_results{bi}.info, 'bone_shape')
+            % Recompute principal axis from bone mask for alignment
+            bm = sep_result.bones{bi}.mask;
+            [rr, cc, ss] = ind2sub(size(ds.HU), find(bm));
+            coords = [rr(:)*ds.spacing(1), cc(:)*ds.spacing(2), ss(:)*ds.spacing(3)];
+            coords = coords - mean(coords, 1);
+            [V, ~] = eig(coords' * coords);
+            bone_axis = V(:, 3);
+        end
+
+        pack_results{bi} = bone.pack_specimens( ...
+            sep_result.bones{bi}.mask, ...
+            seg_results{bi}.cortical, ...
+            seg_results{bi}.cancellous, ...
+            ds, stl_paths, stl_found, opts, bone_axis);
+    end
+    fprintf('\n');
+end
 
 % ==== Stage 6: Visualization ====
 if opts.ShowViewer
@@ -242,6 +288,26 @@ if opts.SaveOutputs
             fprintf(fid, '  BBox: [%d %d %d] to [%d %d %d]\n', b.bbox);
         end
         fprintf(fid, '\nTotal bone volume: %.0f mm^3\n', total_vol);
+
+        % Packing summary
+        has_packing = ~isempty(pack_results) && isstruct(pack_results{1}) && ...
+            isfield(pack_results{1}, 'n_total');
+        if has_packing
+            fprintf(fid, '\n--- SPECIMEN PACKING ---\n');
+            for bi = 1:n_bones
+                pr = pack_results{bi};
+                fprintf(fid, 'Bone %d: %d cortical + %d cancellous = %d specimens\n', ...
+                    bi, pr.n_cortical, pr.n_cancellous, pr.n_total);
+                if isfield(pr, 'summary')
+                    fnames = fieldnames(pr.summary);
+                    for fi = 1:numel(fnames)
+                        s = pr.summary.(fnames{fi});
+                        fprintf(fid, '  %s: %d cortical, %d cancellous\n', ...
+                            fnames{fi}, s.cortical, s.cancellous);
+                    end
+                end
+            end
+        end
         fclose(fid);
         fprintf('  Saved pipeline_summary.txt\n');
     catch ME

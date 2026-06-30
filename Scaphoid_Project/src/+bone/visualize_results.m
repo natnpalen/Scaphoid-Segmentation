@@ -120,6 +120,63 @@ if has_seg
     rotate3d on;
 end
 
+% ---- Specimen Packing 3D view ----
+has_pack = ~isempty(pack_results) && numel(pack_results) >= n_bones && ...
+    isstruct(pack_results{1}) && isfield(pack_results{1}, 'n_total') && ...
+    pack_results{1}.n_total > 0;
+
+if has_pack
+    spec_colors = [1.0 0.2 0.2;   % red
+                   0.2 1.0 0.2;   % green
+                   0.2 0.2 1.0;   % blue
+                   1.0 1.0 0.2];  % yellow
+
+    fig3 = figure('Name', 'Specimen Packing', 'Color', 'w', ...
+        'Position', [150 150 900 700]);
+
+    for bi = 1:n_bones
+        % Show bone as transparent shell
+        mask_i = bones{bi}.mask;
+        if ~any(mask_i(:)), continue; end
+        try
+            fv_bone = isosurface(smooth3(double(mask_i), 'gaussian', 3), 0.5);
+            if ~isempty(fv_bone.vertices)
+                fv_bone.vertices(:,1) = fv_bone.vertices(:,1) * spacing(2);
+                fv_bone.vertices(:,2) = fv_bone.vertices(:,2) * spacing(1);
+                fv_bone.vertices(:,3) = fv_bone.vertices(:,3) * spacing(3);
+                patch(fv_bone, 'FaceColor', [0.9 0.9 0.9], 'EdgeColor', 'none', ...
+                    'FaceAlpha', 0.15);
+                hold on;
+            end
+        catch, end
+
+        pr = pack_results{bi};
+        all_placements = [pr.cortical_placements, pr.cancellous_placements];
+
+        for pi = 1:numel(all_placements)
+            p = all_placements(pi);
+            if ~isfield(p, 'mask') || ~any(p.mask(:)), continue; end
+            try
+                fv_s = isosurface(smooth3(double(p.mask), 'gaussian', 3), 0.5);
+                if isempty(fv_s.vertices), continue; end
+                fv_s.vertices(:,1) = fv_s.vertices(:,1) * spacing(2);
+                fv_s.vertices(:,2) = fv_s.vertices(:,2) * spacing(1);
+                fv_s.vertices(:,3) = fv_s.vertices(:,3) * spacing(3);
+
+                ci = mod(p.shape_idx - 1, size(spec_colors,1)) + 1;
+                patch(fv_s, 'FaceColor', spec_colors(ci,:), 'EdgeColor', 'none', ...
+                    'FaceAlpha', 0.7);
+            catch, end
+        end
+    end
+
+    axis equal vis3d off;
+    camlight headlight; lighting gouraud;
+    total_specs = sum(cellfun(@(p) p.n_total, pack_results));
+    title(sprintf('Specimen Packing: %d specimens placed', total_specs));
+    rotate3d on;
+end
+
 % ---- Save figures ----
 if isfield(opts, 'OutputDir') && ~isempty(opts.OutputDir)
     outDir = opts.OutputDir;
@@ -136,6 +193,15 @@ if isfield(opts, 'OutputDir') && ~isempty(opts.OutputDir)
         try
             saveas(fig2, fullfile(outDir, 'cortical_cancellous_3d.png'));
             fprintf('  [Viz] Saved cortical_cancellous_3d.png\n');
+        catch ME
+            warning('Figure save failed: %s', ME.message);
+        end
+    end
+
+    if has_pack
+        try
+            saveas(fig3, fullfile(outDir, 'specimen_packing_3d.png'));
+            fprintf('  [Viz] Saved specimen_packing_3d.png\n');
         catch ME
             warning('Figure save failed: %s', ME.message);
         end
