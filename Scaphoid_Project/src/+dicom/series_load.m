@@ -6,47 +6,111 @@ Vraw = []; infosCell = {};
 % 1) Try dicomCollection (version-agnostic: no NumImages dependency)
 try
  dc = dicomCollection(folder, 'IncludeSubfolders', true);
+ fprintf('[Load] dicomCollection: %d series found\n', height(dc));
  if height(dc) > 0
-     % Prefer CT if present
+     % Show what was found
      if any(strcmpi(dc.Properties.VariableNames,'Modality'))
+         for ri = 1:height(dc)
+             nImages = 0;
+             if any(strcmpi(dc.Properties.VariableNames,'NumImages'))
+                 nImages = dc.NumImages(ri);
+             end
+             fprintf('       Series %d: Modality=%s, %d images\n', ...
+                 ri, string(dc.Modality(ri)), nImages);
+         end
          isCT = strcmpi(dc.Modality,'CT');
          if any(isCT)
              dc2 = dc(isCT,:);
          else
+             fprintf('[Load] No CT modality found, using all series\n');
              dc2 = dc;
          end
      else
+         fprintf('[Load] No Modality column in dicomCollection\n');
          dc2 = dc;
      end
      % Pick first series — pass the table row directly (version-safe)
      idx = 1;
      try
          [Vraw,~,meta] = dicomreadVolume(dc2(idx,:));
-     catch
-         [Vraw,~,meta] = dicomreadVolume(folder);
+         fprintf('[Load] dicomreadVolume(collection) OK: size %s\n', mat2str(size(Vraw)));
+     catch ME_inner
+         fprintf('[Load] dicomreadVolume(collection) failed: %s\n', ME_inner.message);
+         try
+             [Vraw,~,meta] = dicomreadVolume(folder);
+             fprintf('[Load] dicomreadVolume(folder) fallback OK: size %s\n', mat2str(size(Vraw)));
+         catch ME_inner2
+             fprintf('[Load] dicomreadVolume(folder) fallback also failed: %s\n', ME_inner2.message);
+         end
      end
-     infosCell = normMeta(meta);
+     if ~isempty(Vraw)
+         infosCell = normMeta(meta);
+         fprintf('[Load] Meta cells: %d (volume slices: %d)\n', numel(infosCell), size(Vraw, ndims(Vraw)));
+     end
  end
 catch ME1
  fprintf('[Load] dicomCollection failed: %s\n', ME1.message);
 end
 % 2) Direct bulk read on the folder (works great for Slicer exports)
 if isempty(Vraw)
+ fprintf('[Load] Method 1 produced no volume, trying direct dicomreadVolume(folder)...\n');
  try
      [Vraw,~,meta] = dicomreadVolume(folder);
      infosCell = normMeta(meta);
+     fprintf('[Load] dicomreadVolume(folder) OK: size %s, meta cells: %d\n', ...
+         mat2str(size(Vraw)), numel(infosCell));
  catch ME2
      fprintf('[Load] dicomreadVolume(folder) failed: %s\n', ME2.message);
+     % Show folder contents to help diagnose
+     d = dir(folder);
+     d = d(~[d.isdir]);
+     if isempty(d)
+         fprintf('[Load]   Folder is empty or contains only subdirectories\n');
+         dsub = dir(fullfile(folder, '**', '*'));
+         dsub = dsub(~[dsub.isdir]);
+         fprintf('[Load]   Recursive search: %d files found\n', numel(dsub));
+         if numel(dsub) > 0
+             fprintf('[Load]   First file: %s (%.0f bytes)\n', ...
+                 fullfile(dsub(1).folder, dsub(1).name), dsub(1).bytes);
+         end
+     else
+         exts = {};
+         for di = 1:numel(d)
+             [~,~,ext] = fileparts(d(di).name);
+             if ~ismember(ext, exts), exts{end+1} = ext; end %#ok<AGROW>
+         end
+         fprintf('[Load]   Folder has %d files, extensions: %s\n', numel(d), strjoin(exts, ', '));
+         % Try reading the first file to see if it's valid DICOM
+         try
+             testFile = fullfile(d(1).folder, d(1).name);
+             testInfo = dicominfo(testFile);
+             fprintf('[Load]   First file IS valid DICOM: %s\n', testFile);
+             fprintf('[Load]   Modality=%s, Rows=%d, Cols=%d\n', ...
+                 getField(testInfo, 'Modality', '?'), ...
+                 getField(testInfo, 'Rows', 0), ...
+                 getField(testInfo, 'Columns', 0));
+             if isfield(testInfo, 'SeriesInstanceUID')
+                 fprintf('[Load]   SeriesInstanceUID=%s\n', testInfo.SeriesInstanceUID);
+             end
+         catch
+             fprintf('[Load]   First file is NOT valid DICOM\n');
+         end
+     end
  end
 end
-% 3) Legacy fallback: enumerate files manually (rarely needed here)
+% 3) Legacy fallback: enumerate files manually
 if isempty(Vraw)
+ fprintf('[Load] Methods 1-2 failed. Using legacy manual file enumeration...\n');
  files = listDicomFiles(folder);
- fprintf('[Load] Legacy fallback: found %d candidate files\n', numel(files));
+ fprintf('[Load] Legacy: found %d valid DICOM files\n', numel(files));
  if isempty(files), error('No readable DICOM files found under: %s', folder); end
  [Vraw, infosCell] = tryDicomReadVolume(files, folder);
- if isempty(Vraw)
+ if ~isempty(Vraw)
+     fprintf('[Load] Legacy dicomreadVolume(files) OK: size %s\n', mat2str(size(Vraw)));
+ else
+     fprintf('[Load] Legacy dicomreadVolume(files) failed, using manualReadStack...\n');
      [Vraw, infosCell] = manualReadStack(files);
+     fprintf('[Load] Manual stack read OK: size %s\n', mat2str(size(Vraw)));
  end
 end
 % --- Normalize shape: [R C 1 S] -> [R C S]

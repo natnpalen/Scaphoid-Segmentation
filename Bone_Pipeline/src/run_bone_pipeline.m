@@ -26,7 +26,7 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'RefineBones'         : false (run per-bone FMM refinement)
 %   'PackingOrientations' : 6    (number of orientations per shape)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
-%   'SaveOutputs'         : true
+%   'SaveOutputs'         : true (export MAT, NIfTI, STL files — slow)
 %   'OutputDir'           : ''   (auto-create if empty)
 %   'ShowViewer'          : true (show 3D visualization)
 
@@ -66,11 +66,11 @@ fprintf('  STL   : %s\n', stlFolder);
 fprintf('==========================================================\n\n');
 
 % ==== Stage 1: DICOM Loading ====
-fprintf('[1/7] Loading DICOM series...');
+fprintf('[1/7] Loading DICOM series...\n');
 t1 = tic;
 ds = dicom.series_load(dicomFolder, ...
     'TargetIsoMM', opts.TargetIsoMM, 'Smoothing', opts.Smoothing);
-fprintf(' done (%.1fs)\n', toc(t1));
+fprintf('[1/7] Done (%.1fs)\n', toc(t1));
 fprintf('       Volume %dx%dx%d  |  spacing [%.3f  %.3f  %.3f] mm  |  HU [%.0f, %.0f]\n\n', ...
     ds.size(1), ds.size(2), ds.size(3), ds.spacing, min(ds.HU(:)), max(ds.HU(:)));
 
