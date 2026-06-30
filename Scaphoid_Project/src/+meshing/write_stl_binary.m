@@ -57,8 +57,7 @@ fwrite(fid, hdr, 'uint8');
 fwrite(fid, uint32(nTri), 'uint32');
 
 % ---- Batched records: [12 singles][uint16 attr] per triangle ----
-attr = uint16(0);
-B = 200000; % batch size (triangles) - adjust if memory is tight
+B = 200000;
 
 for s = 1:B:nTri
     e = min(s+B-1, nTri);
@@ -66,8 +65,11 @@ for s = 1:B:nTri
 
     % Pack 12 floats per tri: [nx ny nz x1 y1 z1 x2 y2 z2 x3 y3 z3]
     block = single([ n(s:e,:)  v1(s:e,:)  v2(s:e,:)  v3(s:e,:) ]);
-    % Interleave as a flat vector (row-major in MATLAB, fwrite handles it fine)
-    fwrite(fid, block.', 'single');           % 12*nb singles
-    fwrite(fid, repmat(attr, nb, 1), 'uint16'); % nb attribute words
+    % Convert float data to bytes: 48 bytes per triangle
+    floatBytes = typecast(reshape(block.', [], 1), 'uint8');
+    floatMat = reshape(floatBytes, 48, nb);  % 48 x nb
+    % Append 2-byte attribute (zero) after each triangle's floats
+    recMat = [floatMat; zeros(2, nb, 'uint8')];  % 50 x nb
+    fwrite(fid, recMat(:), 'uint8');
 end
 end
