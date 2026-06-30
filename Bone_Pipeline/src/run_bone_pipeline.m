@@ -6,12 +6,11 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %
 % Pipeline stages:
 %   1. DICOM loading
-%   2. Bone separation (envelope detection for excised-in-air specimens)
-%   3. Per-bone boundary refinement (optional adaptive FMM)
-%   4. Cortical / cancellous segmentation (gradient-based)
-%   5. Specimen packing (greedy mixed packing of STL shapes)
-%   6. Visualization (3D overview)
-%   7. Output saving (MAT + STL + NIfTI)
+%   2. Bone separation (FMM envelope detection for excised-in-air specimens)
+%   3. Cortical / cancellous segmentation (gradient-based)
+%   4. Specimen packing (greedy mixed packing of STL shapes)
+%   5. Visualization (3D overview)
+%   6. Output saving (MAT + STL + NIfTI)
 %
 % Inputs
 %   dicomFolder : path to folder containing DICOM CT series
@@ -23,7 +22,6 @@ function out = run_bone_pipeline(dicomFolder, stlFolder, varargin)
 %   'MinBoneVolMM3'       : 500  (minimum bone component volume)
 %   'ClosingRadiusMM'     : 3.0  (morphological closing radius)
 %   'ArtifactSigmaMM'     : 3.0  (Gaussian falloff for artifact weighting)
-%   'RefineBones'         : false (run per-bone FMM refinement)
 %   'PackSpecimens'       : true (run specimen packing — slow)
 %   'PackingOrientations' : 6    (number of orientations per shape)
 %   'PackingMinDepthMM'   : 0.5  (minimum depth for specimen placement)
@@ -45,7 +43,6 @@ opts = struct( ...
     'ClosingRadiusMM',     3.0, ...
     'ArtifactSigmaMM',     3.0, ...
     'MarkerRangeHU',       [200 700], ...
-    'RefineBones',         false, ...
     'PackSpecimens',       true, ...
     'PackingOrientations', 6, ...
     'PackingMinDepthMM',   0.5, ...
@@ -68,16 +65,16 @@ fprintf('  STL   : %s\n', stlFolder);
 fprintf('==========================================================\n\n');
 
 % ==== Stage 1: DICOM Loading ====
-fprintf('[1/7] Loading DICOM series...\n');
+fprintf('[1/6] Loading DICOM series...\n');
 t1 = tic;
 ds = dicom.series_load(dicomFolder, ...
     'TargetIsoMM', opts.TargetIsoMM, 'Smoothing', opts.Smoothing);
-fprintf('[1/7] Done (%.1fs)\n', toc(t1));
+fprintf('[1/6] Done (%.1fs)\n', toc(t1));
 fprintf('       Volume %dx%dx%d  |  spacing [%.3f  %.3f  %.3f] mm  |  HU [%.0f, %.0f]\n\n', ...
     ds.size(1), ds.size(2), ds.size(3), ds.spacing, min(ds.HU(:)), max(ds.HU(:)));
 
 % ==== Stage 2: Bone Separation ====
-fprintf('[2/7] Separating bones...');
+fprintf('[2/6] Separating bones...');
 t2 = tic;
 sep_result = bone.separate_bones(ds, opts);
 n_bones = numel(sep_result.bones);
@@ -91,24 +88,9 @@ if n_bones == 0
     return;
 end
 
-% ==== Stage 3: Per-bone refinement (optional) ====
-if opts.RefineBones
-    fprintf('[3/7] Refining bone boundaries...');
-    t3 = tic;
-    for bi = 1:n_bones
-        [refined, qc] = bone.segment_single_bone(ds, sep_result.bones{bi}.mask, opts);
-        sep_result.bones{bi}.mask = refined;
-        sep_result.bones{bi}.volume_mm3 = qc.volume_mm3;
-        sep_result.bones{bi}.qc = qc;
-    end
-    fprintf(' done (%.1fs)\n\n', toc(t3));
-else
-    fprintf('[3/7] Bone refinement skipped\n\n');
-end
-
-% ==== Stage 4: Cortical / Cancellous Segmentation ====
-fprintf('[4/7] Cortical/cancellous segmentation...');
-t4 = tic;
+% ==== Stage 3: Cortical / Cancellous Segmentation ====
+fprintf('[3/6] Cortical/cancellous segmentation...');
+t3 = tic;
 seg_results = cell(1, n_bones);
 
 bone_masks = cell(1, n_bones);
@@ -128,82 +110,82 @@ else
         seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
     end
 end
-fprintf(' done (%.1fs)%s\n\n', toc(t4), ternary(use_parallel, ' [parallel]', ''));
+fprintf(' done (%.1fs)%s\n\n', toc(t3), ternary(use_parallel, ' [parallel]', ''));
 
-% ==== Stage 5: Specimen Packing ====
+% ==== Stage 4: Specimen Packing ====
 pack_results = cell(1, n_bones);
 if ~opts.PackSpecimens
-    fprintf('[5/7] Specimen packing skipped (PackSpecimens=false)\n\n');
+    fprintf('[4/6] Specimen packing skipped (PackSpecimens=false)\n\n');
 else
-stl_names = {'Bend', 'Compression', 'Punch', 'Shear'};
-stl_paths = {};
-stl_found = {};
-for si = 1:numel(stl_names)
-    candidates = {fullfile(stlFolder, [stl_names{si} '.STL']), ...
-                  fullfile(stlFolder, [stl_names{si} '.stl'])};
-    for ci = 1:numel(candidates)
-        if exist(candidates{ci}, 'file')
-            stl_paths{end+1} = candidates{ci}; %#ok<AGROW>
-            stl_found{end+1} = stl_names{si}; %#ok<AGROW>
-            break;
+    stl_names = {'Bend', 'Compression', 'Punch', 'Shear'};
+    stl_paths = {};
+    stl_found = {};
+    for si = 1:numel(stl_names)
+        candidates = {fullfile(stlFolder, [stl_names{si} '.STL']), ...
+                      fullfile(stlFolder, [stl_names{si} '.stl'])};
+        for ci = 1:numel(candidates)
+            if exist(candidates{ci}, 'file')
+                stl_paths{end+1} = candidates{ci}; %#ok<AGROW>
+                stl_found{end+1} = stl_names{si}; %#ok<AGROW>
+                break;
+            end
         end
     end
-end
 
-if isempty(stl_paths)
-    fprintf('[5/7] Specimen packing skipped (no STL files found)\n\n');
-else
-    fprintf('[5/7] Packing specimens (%s)...', strjoin(stl_found, ', '));
-    t5 = tic;
-
-    bone_axes = cell(1, n_bones);
-    corticals = cell(1, n_bones);
-    cancellouses = cell(1, n_bones);
-    for bi = 1:n_bones
-        bone_axes{bi} = [0; 0; 1];
-        if isfield(seg_results{bi}.info, 'bone_shape')
-            bm = bone_masks{bi};
-            [rr, cc, ss] = ind2sub(size(ds.HU), find(bm));
-            coords = [rr(:)*ds.spacing(1), cc(:)*ds.spacing(2), ss(:)*ds.spacing(3)];
-            coords = coords - mean(coords, 1);
-            [V, ~] = eig(coords' * coords);
-            bone_axes{bi} = V(:, 3);
-        end
-        corticals{bi} = seg_results{bi}.cortical;
-        cancellouses{bi} = seg_results{bi}.cancellous;
-    end
-
-    if use_parallel
-        parfor bi = 1:n_bones
-            pack_results{bi} = bone.pack_specimens( ...
-                bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
-                ds, stl_paths, stl_found, opts, bone_axes{bi});
-        end
+    if isempty(stl_paths)
+        fprintf('[4/6] Specimen packing skipped (no STL files found)\n\n');
     else
+        fprintf('[4/6] Packing specimens (%s)...', strjoin(stl_found, ', '));
+        t4 = tic;
+
+        bone_axes = cell(1, n_bones);
+        corticals = cell(1, n_bones);
+        cancellouses = cell(1, n_bones);
         for bi = 1:n_bones
-            pack_results{bi} = bone.pack_specimens( ...
-                bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
-                ds, stl_paths, stl_found, opts, bone_axes{bi});
+            bone_axes{bi} = [0; 0; 1];
+            if isfield(seg_results{bi}.info, 'bone_shape')
+                bm = bone_masks{bi};
+                [rr, cc, ss] = ind2sub(size(ds.HU), find(bm));
+                coords = [rr(:)*ds.spacing(1), cc(:)*ds.spacing(2), ss(:)*ds.spacing(3)];
+                coords = coords - mean(coords, 1);
+                [V, ~] = eig(coords' * coords);
+                bone_axes{bi} = V(:, 3);
+            end
+            corticals{bi} = seg_results{bi}.cortical;
+            cancellouses{bi} = seg_results{bi}.cancellous;
         end
+
+        if use_parallel
+            parfor bi = 1:n_bones
+                pack_results{bi} = bone.pack_specimens( ...
+                    bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
+                    ds, stl_paths, stl_found, opts, bone_axes{bi});
+            end
+        else
+            for bi = 1:n_bones
+                pack_results{bi} = bone.pack_specimens( ...
+                    bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
+                    ds, stl_paths, stl_found, opts, bone_axes{bi});
+            end
+        end
+        fprintf(' done (%.1fs)%s\n\n', toc(t4), ternary(use_parallel, ' [parallel]', ''));
     end
-    fprintf(' done (%.1fs)%s\n\n', toc(t5), ternary(use_parallel, ' [parallel]', ''));
-end
 end
 
-% ==== Stage 6: Visualization ====
+% ==== Stage 5: Visualization ====
 if opts.ShowViewer
-    fprintf('[6/7] Generating visualizations...');
-    t6 = tic;
+    fprintf('[5/6] Generating visualizations...');
+    t5 = tic;
     bone.visualize_results(ds, sep_result, seg_results, pack_results, opts);
-    fprintf(' done (%.1fs)\n\n', toc(t6));
+    fprintf(' done (%.1fs)\n\n', toc(t5));
 else
-    fprintf('[6/7] Visualization skipped\n\n');
+    fprintf('[5/6] Visualization skipped\n\n');
 end
 
-% ==== Stage 7: Save Outputs ====
+% ==== Stage 6: Save Outputs ====
 if opts.SaveOutputs
-    fprintf('[7/7] Saving outputs...');
-    t7 = tic;
+    fprintf('[6/6] Saving outputs...');
+    t6 = tic;
 
     if isempty(opts.OutputDir)
         [parentDir, seriesName] = fileparts(string(dicomFolder));
@@ -308,11 +290,11 @@ if opts.SaveOutputs
         warning('Summary save failed: %s', ME.message);
     end
 
-    fprintf(' done (%.1fs)\n', toc(t7));
+    fprintf(' done (%.1fs)\n', toc(t6));
     fprintf('       Output: %s\n\n', outDir);
     out.outputDir = outDir;
 else
-    fprintf('[7/7] Output saving skipped\n\n');
+    fprintf('[6/6] Output saving skipped\n\n');
 end
 
 % ==== Build output struct ====
