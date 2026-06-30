@@ -4,30 +4,19 @@ function pack_result = pack_specimens(bone_mask, cortical, cancellous, ds, stl_p
 %   pack_result = bone.pack_specimens(bone_mask, cortical, cancellous, ds, ...
 %       stl_paths, shape_names, opts, bone_axis)
 %
-% Places all 4 specimen types (Bend, Compression, Punch, Shear) into both
-% cortical and cancellous regions. Uses convolution-based fit scoring for
-% fast placement, with orientations aligned to the bone's principal axis.
+% Uses oriented bounding box (OBB) fitting instead of voxelization.
+% Each STL specimen is represented by its exact rectangular prism dimensions
+% (from the mesh extents), then tested at bone-aligned orientations against
+% the actual region mask. This is faster and geometrically exact for
+% prismatic machined specimens.
 %
 % Strategy:
-%   1. Voxelize each STL specimen at bone-aligned orientations
-%   2. For each region (cortical, cancellous):
+%   1. Read each STL to get its bounding box dimensions (mm)
+%   2. Generate bone-aligned orientations from the principal axis
+%   3. For each region (cortical, cancellous):
 %      a. Place one of each specimen type first (priority constraint)
 %      b. Then greedily pack additional specimens to maximize count
-%   3. No overlap between placements within a region
-%
-% Inputs
-%   bone_mask    : logical 3D full bone mask
-%   cortical     : logical 3D cortical region
-%   cancellous   : logical 3D cancellous region
-%   ds           : dataset struct from dicom.series_load
-%   stl_paths    : cell array of STL file paths
-%   shape_names  : cell array of shape names
-%   opts         : pipeline options struct
-%   bone_axis    : [3x1] principal axis direction from PCA
-%
-% Output
-%   pack_result  : struct with .cortical_placements, .cancellous_placements,
-%                  .summary
+%   4. No overlap between placements within a region
 
 spacing = ds.spacing;
 vol = double(ds.HU);
@@ -39,42 +28,51 @@ canc_vol = sum(cancellous(:)) * voxel_vol;
 fprintf('      Cortical region: %.0f mm^3\n', cort_vol);
 fprintf('      Cancellous region: %.0f mm^3\n', canc_vol);
 
-% ---- Voxelize all shapes at bone-aligned orientations ----
-fprintf('      Voxelizing %d specimen types...\n', n_shapes);
+% ---- Read STL bounding box dimensions ----
+fprintf('      Reading %d specimen geometries...\n', n_shapes);
 rotations = generate_bone_aligned_rotations(bone_axis, opts.PackingOrientations);
 n_orient = size(rotations, 3);
 
 templates = {};
 for si = 1:n_shapes
     fprintf('        %s: ', shape_names{si});
-    n_valid = 0;
-    for oi = 1:n_orient
-        try
-            [shape_mask, ~] = bone.voxelize_stl(stl_paths{si}, spacing);
-            if oi > 1
-                shape_mask = rotate_mask_3d(shape_mask, rotations(:,:,oi));
-            end
-            shape_vol = sum(shape_mask(:)) * voxel_vol;
-            if shape_vol < 0.1, continue; end
-
-            tpl = struct();
-            tpl.shape_idx = si;
-            tpl.shape_name = shape_names{si};
-            tpl.orientation = oi;
-            tpl.mask = shape_mask;
-            tpl.volume_mm3 = shape_vol;
-            tpl.sz = size(shape_mask);
-            templates{end+1} = tpl; %#ok<AGROW>
-            n_valid = n_valid + 1;
-        catch
-            continue;
-        end
+    try
+        TR = stlread(stl_paths{si});
+        V = double(TR.Points);
+        V = V - mean(V, 1);
+        bbox_mm = max(V, [], 1) - min(V, [], 1);
+        mesh_vol = prod(bbox_mm);
+        fprintf('%.1f x %.1f x %.1f mm (%.0f mm^3 OBB)\n', ...
+            bbox_mm(1), bbox_mm(2), bbox_mm(3), mesh_vol);
+    catch ME
+        fprintf('FAILED: %s\n', ME.message);
+        continue;
     end
-    fprintf('%d orientations (%.0f mm^3)\n', n_valid, ...
-        ternary(n_valid > 0, templates{end}.volume_mm3, 0));
+
+    for oi = 1:n_orient
+        R = rotations(:,:,oi);
+        corners = bbox_corners(bbox_mm);
+        rotated_corners = (R * corners')';
+        obb_extent = max(rotated_corners, [], 1) - min(rotated_corners, [], 1);
+
+        obb_vox = ceil(obb_extent ./ spacing);
+        if any(obb_vox < 1), continue; end
+
+        tpl = struct();
+        tpl.shape_idx = si;
+        tpl.shape_name = shape_names{si};
+        tpl.orientation = oi;
+        tpl.rotation = R;
+        tpl.bbox_mm = bbox_mm;
+        tpl.obb_extent_mm = obb_extent;
+        tpl.obb_vox = obb_vox;
+        tpl.volume_mm3 = mesh_vol;
+        templates{end+1} = tpl; %#ok<AGROW>
+    end
 end
 
-fprintf('      %d total templates\n', numel(templates));
+fprintf('      %d total templates (%d shapes x %d orientations)\n', ...
+    numel(templates), n_shapes, n_orient);
 
 if isempty(templates)
     pack_result = empty_result();
@@ -96,7 +94,6 @@ pack_result.n_cortical = numel(cort_placements);
 pack_result.n_cancellous = numel(canc_placements);
 pack_result.n_total = numel(cort_placements) + numel(canc_placements);
 
-% Summary by type
 pack_result.summary = struct();
 for si = 1:n_shapes
     n_cort = sum(arrayfun(@(p) p.shape_idx == si, cort_placements));
@@ -112,15 +109,15 @@ end
 
 
 % =========================================================================
-%  REGION PACKING
+%  REGION PACKING (OBB-based)
 % =========================================================================
 function placements = pack_region(region, templates, vol, spacing, shape_names, n_shapes)
-% Greedy packing into a single region. Priority: one of each type first.
 
     voxel_vol = prod(spacing);
     region_vol = sum(region(:)) * voxel_vol;
     placements = struct('shape_name', {}, 'shape_idx', {}, 'orientation', {}, ...
-        'position_vox', {}, 'volume_mm3', {}, 'mean_hu', {}, 'mask', {});
+        'position_vox', {}, 'obb_vox', {}, 'obb_extent_mm', {}, ...
+        'volume_mm3', {}, 'mean_hu', {}, 'fit_fraction', {});
 
     if region_vol < 1.0
         fprintf('        Region too small (%.0f mm^3), skipping\n', region_vol);
@@ -128,20 +125,21 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
     end
 
     available = region;
-    types_placed = false(1, n_shapes);
+    vol_sz = size(available);
+
+    % Precompute distance transform once (recomputed after each placement)
+    D = bwdist(~available) .* mean(spacing);
 
     % Phase 1: one of each type (priority)
     for si = 1:n_shapes
-        type_templates = cellfun(@(t) t.shape_idx == si, templates);
-        type_idx = find(type_templates);
+        type_idx = find(cellfun(@(t) t.shape_idx == si, templates));
         if isempty(type_idx), continue; end
 
-        [p, available] = try_place_best(available, templates(type_idx), vol, spacing);
+        [p, available, D] = try_place_best(available, D, templates(type_idx), vol, spacing);
         if ~isempty(p)
             placements(end+1) = p; %#ok<AGROW>
-            types_placed(si) = true;
-            fprintf('        [priority] Placed %s at [%d %d %d] (%.0f mm^3)\n', ...
-                p.shape_name, p.position_vox, p.volume_mm3);
+            fprintf('        [priority] Placed %s (%.1fx%.1fx%.1f mm) at [%d %d %d] fit=%.0f%%\n', ...
+                p.shape_name, p.obb_extent_mm, p.position_vox, p.fit_fraction*100);
         else
             fprintf('        [priority] %s: does not fit\n', shape_names{si});
         end
@@ -152,12 +150,12 @@ function placements = pack_region(region, templates, vol, spacing, shape_names, 
     for attempt = 1:max_additional
         if ~any(available(:)), break; end
 
-        [p, available] = try_place_best(available, templates, vol, spacing);
+        [p, available, D] = try_place_best(available, D, templates, vol, spacing);
         if isempty(p), break; end
 
         placements(end+1) = p; %#ok<AGROW>
-        fprintf('        [greedy] Placed %s at [%d %d %d] (%.0f mm^3)\n', ...
-            p.shape_name, p.position_vox, p.volume_mm3);
+        fprintf('        [greedy] Placed %s (%.1fx%.1fx%.1f mm) at [%d %d %d] fit=%.0f%%\n', ...
+            p.shape_name, p.obb_extent_mm, p.position_vox, p.fit_fraction*100);
     end
 
     fprintf('        Total: %d specimens in %.0f mm^3 region\n', ...
@@ -166,72 +164,66 @@ end
 
 
 % =========================================================================
-%  PLACEMENT SEARCH (convolution-based)
+%  PLACEMENT SEARCH (OBB sliding window)
 % =========================================================================
-function [placement, available] = try_place_best(available, templates, vol, spacing)
-% Find the best placement among all templates using convolution scoring.
+function [placement, available, D] = try_place_best(available, D, templates, vol, spacing)
 
     placement = [];
     best_score = -Inf;
     best_pos = [];
     best_tpl = [];
-    best_placed_mask = [];
+    best_fit_frac = 0;
 
     vol_sz = size(available);
 
+    S = cumsum3(single(available));
+    S_d = cumsum3(single(D));
+
     for ti = 1:numel(templates)
         tpl = templates{ti};
-        tsz = tpl.sz;
+        bsz = tpl.obb_vox;
 
-        % Template must fit within volume dimensions
-        if any(tsz > vol_sz), continue; end
+        if any(bsz > vol_sz), continue; end
 
-        % Convolution: count how many template voxels overlap available region
-        % convn with 'valid' mode gives overlap at every valid position
-        overlap_count = convn(single(available), flip_3d(single(tpl.mask)), 'valid');
-        n_template_vox = sum(tpl.mask(:));
+        n_box_vox = prod(bsz);
 
-        % Fit fraction at each position
-        fit_frac = overlap_count / max(1, n_template_vox);
+        overlap = box_sum(S, vol_sz, bsz);
 
-        % Require >= 95% fit
-        good_fit = fit_frac >= 0.95;
+        fit_frac = overlap / max(1, n_box_vox);
+        good_fit = fit_frac >= 0.90;
         if ~any(good_fit(:)), continue; end
 
-        % Score by depth: prefer placements deep inside the region
-        D = bwdist(~available) .* mean(spacing);
-        % Average depth at each candidate position via convolution
-        depth_sum = convn(single(D), flip_3d(single(tpl.mask)), 'valid');
-        avg_depth = depth_sum / max(1, n_template_vox);
+        depth_sum = box_sum(S_d, vol_sz, bsz);
+        avg_depth = depth_sum / max(1, n_box_vox);
 
-        % Combined score: fit fraction + average depth
         score_map = fit_frac + avg_depth;
         score_map(~good_fit) = -Inf;
 
         [local_best, linear_idx] = max(score_map(:));
         if local_best > best_score
-            [pr, pc, ps] = ind2sub(size(score_map), linear_idx);
+            out_sz = vol_sz - bsz + 1;
+            [pr, pc, ps] = ind2sub(out_sz, linear_idx);
             best_score = local_best;
             best_pos = [pr, pc, ps];
             best_tpl = tpl;
+            best_fit_frac = fit_frac(linear_idx);
         end
     end
 
     if isempty(best_pos), return; end
 
-    % Build placed mask
     r1 = best_pos(1); c1 = best_pos(2); s1 = best_pos(3);
-    tsz = best_tpl.sz;
-    r2 = r1 + tsz(1) - 1;
-    c2 = c1 + tsz(2) - 1;
-    s2 = s1 + tsz(3) - 1;
+    bsz = best_tpl.obb_vox;
+    r2 = r1 + bsz(1) - 1;
+    c2 = c1 + bsz(2) - 1;
+    s2 = s1 + bsz(3) - 1;
 
-    placed_mask = false(vol_sz);
-    placed_mask(r1:r2, c1:c2, s1:s2) = best_tpl.mask;
-    placed_mask = placed_mask & available;
+    box_mask = false(vol_sz);
+    box_mask(r1:r2, c1:c2, s1:s2) = true;
+    placed = box_mask & available;
 
-    % Verify fit
-    if sum(placed_mask(:)) < 0.90 * sum(best_tpl.mask(:))
+    actual_fit = sum(placed(:)) / prod(bsz);
+    if actual_fit < 0.85
         return;
     end
 
@@ -240,17 +232,59 @@ function [placement, available] = try_place_best(available, templates, vol, spac
     placement.shape_idx = best_tpl.shape_idx;
     placement.orientation = best_tpl.orientation;
     placement.position_vox = best_pos;
+    placement.obb_vox = bsz;
+    placement.obb_extent_mm = best_tpl.obb_extent_mm;
     placement.volume_mm3 = best_tpl.volume_mm3;
-    placement.mean_hu = mean(vol(placed_mask));
-    placement.mask = placed_mask;
+    placement.mean_hu = mean(vol(placed));
+    placement.fit_fraction = actual_fit;
 
-    % Remove placed voxels from available
-    available(placed_mask) = false;
+    available(box_mask) = false;
+    D = bwdist(~available) .* mean(spacing);
 end
 
 
-function flipped = flip_3d(A)
-    flipped = flip(flip(flip(A, 1), 2), 3);
+% =========================================================================
+%  3D INTEGRAL IMAGE (zero-padded cumulative sum)
+% =========================================================================
+function S = cumsum3(A)
+    % Zero-pad so S(0,:,:) = 0, allowing clean subtraction in box_sum
+    sz = size(A);
+    S = zeros(sz + 1, 'like', A);
+    S(2:end, 2:end, 2:end) = cumsum(cumsum(cumsum(A, 1), 2), 3);
+end
+
+
+% =========================================================================
+%  BOX SUM via integral image (1-indexed input, S is 0-padded)
+% =========================================================================
+function result = box_sum(S, vol_sz, bsz)
+    out_sz = vol_sz - bsz + 1;
+    if any(out_sz < 1)
+        result = zeros(0);
+        return;
+    end
+
+    % In the padded S, S(i+1,j+1,k+1) = sum of A(1:i, 1:j, 1:k)
+    % Box sum at position (r,c,s) with size bsz:
+    %   sum of A(r:r+bsz-1, c:c+bsz-1, s:s+bsz-1)
+    r1 = 1:out_sz(1);  r2 = r1 + bsz(1);
+    c1 = 1:out_sz(2);  c2 = c1 + bsz(2);
+    s1 = 1:out_sz(3);  s2 = s1 + bsz(3);
+
+    result = S(r2, c2, s2) ...
+           - S(r1, c2, s2) - S(r2, c1, s2) - S(r2, c2, s1) ...
+           + S(r1, c1, s2) + S(r1, c2, s1) + S(r2, c1, s1) ...
+           - S(r1, c1, s1);
+end
+
+
+% =========================================================================
+%  BBOX CORNERS (8 corners of a bounding box centered at origin)
+% =========================================================================
+function C = bbox_corners(bbox_mm)
+    hx = bbox_mm(1)/2; hy = bbox_mm(2)/2; hz = bbox_mm(3)/2;
+    C = [ hx  hy  hz;  hx  hy -hz;  hx -hy  hz;  hx -hy -hz;
+         -hx  hy  hz; -hx  hy -hz; -hx -hy  hz; -hx -hy -hz];
 end
 
 
@@ -258,12 +292,9 @@ end
 %  BONE-ALIGNED ROTATIONS
 % =========================================================================
 function R = generate_bone_aligned_rotations(bone_axis, n_orient)
-% Generate rotations that align the specimen's Z-axis with the bone's
-% principal axis, plus 90-degree rotations about and perpendicular to it.
 
     bone_axis = bone_axis(:) / norm(bone_axis);
 
-    % Build orthonormal frame: bone_axis = new Z
     if abs(bone_axis(1)) < 0.9
         perp = cross(bone_axis, [1;0;0]);
     else
@@ -273,15 +304,13 @@ function R = generate_bone_aligned_rotations(bone_axis, n_orient)
     perp2 = cross(bone_axis, perp);
     perp2 = perp2 / norm(perp2);
 
-    % Base rotation: align specimen Z with bone axis
-    R_base = [perp, perp2, bone_axis]';  % 3x3
+    R_base = [perp, perp2, bone_axis]';
 
-    % Generate additional rotations by rotating about bone axis
     R = zeros(3, 3, min(n_orient, 12));
     idx = 0;
 
-    angles_about_axis = [0, 90, 180, 270];  % degrees
-    angles_perpendicular = [0, 90];          % tip specimen sideways
+    angles_about_axis = [0, 90, 180, 270];
+    angles_perpendicular = [0, 90];
 
     for ai = 1:numel(angles_about_axis)
         for pi = 1:numel(angles_perpendicular)
@@ -291,9 +320,7 @@ function R = generate_bone_aligned_rotations(bone_axis, n_orient)
             theta = deg2rad(angles_about_axis(ai));
             phi = deg2rad(angles_perpendicular(pi));
 
-            % Rotation about bone axis
             Rz = [cos(theta) -sin(theta) 0; sin(theta) cos(theta) 0; 0 0 1];
-            % Rotation about perp axis (tip)
             Rx = [1 0 0; 0 cos(phi) -sin(phi); 0 sin(phi) cos(phi)];
 
             R(:,:,idx) = R_base * Rz * Rx;
@@ -306,49 +333,17 @@ end
 
 
 % =========================================================================
-%  MASK ROTATION
-% =========================================================================
-function rotated = rotate_mask_3d(mask, R)
-    sz = size(mask);
-    center = (sz + 1) / 2;
-
-    [rr, cc, ss] = ind2sub(sz, find(mask));
-    coords = [rr - center(1), cc - center(2), ss - center(3)];
-    coords_rot = coords * R';
-
-    new_coords = round(coords_rot);
-    new_coords = new_coords - min(new_coords, [], 1) + 1;
-
-    new_sz = max(new_coords, [], 1);
-    rotated = false(new_sz);
-
-    valid = all(new_coords >= 1, 2) & ...
-            new_coords(:,1) <= new_sz(1) & ...
-            new_coords(:,2) <= new_sz(2) & ...
-            new_coords(:,3) <= new_sz(3);
-
-    idx = sub2ind(new_sz, new_coords(valid,1), new_coords(valid,2), new_coords(valid,3));
-    rotated(idx) = true;
-
-    rotated = imclose(rotated, strel('sphere', 1));
-end
-
-
-% =========================================================================
 %  UTILITIES
 % =========================================================================
 function r = empty_result()
     r = struct();
     r.cortical_placements = struct('shape_name', {}, 'shape_idx', {}, ...
-        'orientation', {}, 'position_vox', {}, 'volume_mm3', {}, ...
-        'mean_hu', {}, 'mask', {});
+        'orientation', {}, 'position_vox', {}, 'obb_vox', {}, ...
+        'obb_extent_mm', {}, 'volume_mm3', {}, 'mean_hu', {}, ...
+        'fit_fraction', {});
     r.cancellous_placements = r.cortical_placements;
     r.n_cortical = 0;
     r.n_cancellous = 0;
     r.n_total = 0;
     r.summary = struct();
-end
-
-function s = ternary(cond, a, b)
-    if cond, s = a; else, s = b; end
 end

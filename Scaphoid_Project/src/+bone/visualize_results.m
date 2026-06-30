@@ -155,17 +155,29 @@ if has_pack
 
         for pi = 1:numel(all_placements)
             p = all_placements(pi);
-            if ~isfield(p, 'mask') || ~any(p.mask(:)), continue; end
+            if ~isfield(p, 'position_vox'), continue; end
             try
-                fv_s = isosurface(smooth3(double(p.mask), 'gaussian', 3), 0.5);
-                if isempty(fv_s.vertices), continue; end
-                fv_s.vertices(:,1) = fv_s.vertices(:,1) * spacing(2);
-                fv_s.vertices(:,2) = fv_s.vertices(:,2) * spacing(1);
-                fv_s.vertices(:,3) = fv_s.vertices(:,3) * spacing(3);
+                pos = p.position_vox;
+                bsz = p.obb_vox;
+
+                % Box corners in voxel coords, scaled to mm
+                x1 = pos(2) * spacing(2);  x2 = (pos(2) + bsz(2) - 1) * spacing(2);
+                y1 = pos(1) * spacing(1);  y2 = (pos(1) + bsz(1) - 1) * spacing(1);
+                z1 = pos(3) * spacing(3);  z2 = (pos(3) + bsz(3) - 1) * spacing(3);
+
+                verts = [x1 y1 z1; x2 y1 z1; x2 y2 z1; x1 y2 z1;
+                         x1 y1 z2; x2 y1 z2; x2 y2 z2; x1 y2 z2];
+                faces = [1 2 3 4; 5 6 7 8; 1 2 6 5; 3 4 8 7; 1 4 8 5; 2 3 7 6];
 
                 ci = mod(p.shape_idx - 1, size(spec_colors,1)) + 1;
-                patch(fv_s, 'FaceColor', spec_colors(ci,:), 'EdgeColor', 'none', ...
-                    'FaceAlpha', 0.7);
+                patch('Vertices', verts, 'Faces', faces, ...
+                    'FaceColor', spec_colors(ci,:), 'EdgeColor', spec_colors(ci,:)*0.5, ...
+                    'FaceAlpha', 0.6, 'LineWidth', 1.5);
+
+                center = [(x1+x2)/2, (y1+y2)/2, (z1+z2)/2];
+                text(center(1), center(2), center(3), p.shape_name, ...
+                    'FontSize', 7, 'FontWeight', 'bold', ...
+                    'HorizontalAlignment', 'center', 'Color', 'k');
             catch, end
         end
     end

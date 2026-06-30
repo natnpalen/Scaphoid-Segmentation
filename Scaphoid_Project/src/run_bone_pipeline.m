@@ -108,13 +108,33 @@ end
 % ==== Stage 4: Cortical / Cancellous Segmentation ====
 fprintf('[Stage 4] Cortical / cancellous segmentation...\n');
 seg_results = cell(1, n_bones);
+
+% Extract bone masks for parfor (avoid broadcast of entire sep_result)
+bone_masks = cell(1, n_bones);
 for bi = 1:n_bones
-    fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
-        sep_result.bones{bi}.volume_mm3);
-    [cort, canc, seg_info] = bone.cortical_cancellous(ds, sep_result.bones{bi}.mask, opts);
-    seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
-    fprintf('    %s | %d slabs | mean depth: %.2f mm | mean thr: %.0f HU\n', ...
-        seg_info.method, seg_info.n_slabs, ...
+    bone_masks{bi} = sep_result.bones{bi}.mask;
+end
+
+use_parallel = ~isempty(ver('parallel')) && n_bones > 1;
+if use_parallel
+    fprintf('  Using parallel processing (%d bones)...\n', n_bones);
+    parfor bi = 1:n_bones
+        [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
+        seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+    end
+else
+    for bi = 1:n_bones
+        fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
+            sep_result.bones{bi}.volume_mm3);
+        [cort, canc, seg_info] = bone.cortical_cancellous(ds, bone_masks{bi}, opts);
+        seg_results{bi} = struct('cortical', cort, 'cancellous', canc, 'info', seg_info);
+    end
+end
+
+for bi = 1:n_bones
+    seg_info = seg_results{bi}.info;
+    fprintf('  Bone %d: %s | %d slabs | mean depth: %.2f mm | mean thr: %.0f HU\n', ...
+        bi, seg_info.method, seg_info.n_slabs, ...
         seg_info.mean_cortical_depth_mm, seg_info.mean_threshold_hu);
     fprintf('    Cortical: %.0f mm^3 (%.0f%%) | Cancellous: %.0f mm^3\n', ...
         seg_info.cortical_volume_mm3, seg_info.cortical_fraction*100, ...
@@ -149,26 +169,40 @@ if isempty(stl_paths)
 else
     fprintf('  Found %d specimen types: %s\n', numel(stl_found), strjoin(stl_found, ', '));
     pack_results = cell(1, n_bones);
-    for bi = 1:n_bones
-        fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
-            sep_result.bones{bi}.volume_mm3);
 
-        bone_axis = [0; 0; 1];  % default
+    % Precompute bone axes
+    bone_axes = cell(1, n_bones);
+    corticals = cell(1, n_bones);
+    cancellouses = cell(1, n_bones);
+    for bi = 1:n_bones
+        bone_axes{bi} = [0; 0; 1];
         if isfield(seg_results{bi}.info, 'bone_shape')
-            % Recompute principal axis from bone mask for alignment
-            bm = sep_result.bones{bi}.mask;
+            bm = bone_masks{bi};
             [rr, cc, ss] = ind2sub(size(ds.HU), find(bm));
             coords = [rr(:)*ds.spacing(1), cc(:)*ds.spacing(2), ss(:)*ds.spacing(3)];
             coords = coords - mean(coords, 1);
             [V, ~] = eig(coords' * coords);
-            bone_axis = V(:, 3);
+            bone_axes{bi} = V(:, 3);
         end
+        corticals{bi} = seg_results{bi}.cortical;
+        cancellouses{bi} = seg_results{bi}.cancellous;
+    end
 
-        pack_results{bi} = bone.pack_specimens( ...
-            sep_result.bones{bi}.mask, ...
-            seg_results{bi}.cortical, ...
-            seg_results{bi}.cancellous, ...
-            ds, stl_paths, stl_found, opts, bone_axis);
+    if use_parallel
+        fprintf('  Using parallel processing (%d bones)...\n', n_bones);
+        parfor bi = 1:n_bones
+            pack_results{bi} = bone.pack_specimens( ...
+                bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
+                ds, stl_paths, stl_found, opts, bone_axes{bi});
+        end
+    else
+        for bi = 1:n_bones
+            fprintf('  Bone %d/%d (%.0f mm^3):\n', bi, n_bones, ...
+                sep_result.bones{bi}.volume_mm3);
+            pack_results{bi} = bone.pack_specimens( ...
+                bone_masks{bi}, corticals{bi}, cancellouses{bi}, ...
+                ds, stl_paths, stl_found, opts, bone_axes{bi});
+        end
     end
     fprintf('\n');
 end
